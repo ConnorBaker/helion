@@ -24,6 +24,7 @@ Example usage:
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 from typing import TYPE_CHECKING
 from typing import Any
@@ -31,6 +32,12 @@ from typing import Sequence
 
 from . import exc
 from .base_search import BaseSearch
+from .config_fragment import BooleanFragment
+from .config_fragment import EnumFragment
+from .config_fragment import IntegerFragment
+from .config_fragment import ListOf
+from .config_fragment import PermutationFragment
+from .config_fragment import PowerOfTwoFragment
 from .config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
@@ -257,108 +264,97 @@ class OptunaSearch(BaseSearch):
         Returns:
             Suggested configuration.
         """
-        flat_config = []
+        flat_config: list[object] = []
 
         # Iterate through flat spec fragments
         for idx, fragment in enumerate(self.config_gen.flat_spec):
-            # Get the type of fragment
-            fragment_type = type(fragment).__name__
             # Use index-based parameter names
             param_base = f"p{idx}"
 
-            if fragment_type == "PowerOfTwoFragment":
-                # Power of two: suggest in log space
-                min_val = fragment.min_value
-                max_val = fragment.max_value
-                # Optuna expects integer for suggest_int
-                import math
+            match fragment:
+                case PowerOfTwoFragment(low=low, high=high):
+                    # Power of two: suggest in log space
+                    min_exp = int(math.log2(low))
+                    max_exp = int(math.log2(high))
+                    exp = trial.suggest_int(f"{param_base}_exp", min_exp, max_exp)
+                    flat_config.append(2**exp)
 
-                min_exp = int(math.log2(min_val))
-                max_exp = int(math.log2(max_val))
-                exp = trial.suggest_int(f"{param_base}_exp", min_exp, max_exp)
-                flat_config.append(2**exp)
+                case IntegerFragment(low=low, high=high):
+                    # Integer range
+                    value = trial.suggest_int(param_base, low, high)
+                    flat_config.append(value)
 
-            elif fragment_type == "IntegerFragment":
-                # Integer range
-                value = trial.suggest_int(
-                    param_base, fragment.min_value, fragment.max_value
-                )
-                flat_config.append(value)
+                case EnumFragment(choices=choices):
+                    # Categorical choice
+                    value = trial.suggest_categorical(param_base, choices)
+                    flat_config.append(value)
 
-            elif fragment_type == "EnumFragment":
-                # Categorical choice
-                value = trial.suggest_categorical(param_base, fragment.values)
-                flat_config.append(value)
+                case BooleanFragment():
+                    # Boolean as categorical
+                    value = trial.suggest_categorical(param_base, [False, True])
+                    flat_config.append(value)
 
-            elif fragment_type == "BooleanFragment":
-                # Boolean as categorical
-                value = trial.suggest_categorical(param_base, [False, True])
-                flat_config.append(value)
-
-            elif fragment_type == "PermutationFragment":
-                # Permutation: use rank-based encoding
-                # For each position i, we select which of the remaining elements (rank 0 to n-i-1)
-                # This avoids the issue of dynamic categorical choices
-                n = fragment.size
-                available = list(range(n))
-                perm = []
-                for i in range(n):
-                    if len(available) == 1:
-                        # Only one element left
-                        perm.append(available[0])
-                    else:
-                        # Suggest rank (which remaining element to pick)
-                        rank = trial.suggest_int(
-                            f"{param_base}_rank{i}", 0, len(available) - 1
-                        )
-                        selected = available[rank]
-                        perm.append(selected)
-                        available.remove(selected)
-                flat_config.append(tuple(perm))
-
-            elif fragment_type == "ListOf":
-                # List of values: suggest each independently
-                values = []
-                for i in range(fragment.size):
-                    element_fragment = fragment.fragment
-                    element_type = type(element_fragment).__name__
-
-                    if element_type == "PowerOfTwoFragment":
-                        import math
-
-                        min_exp = int(math.log2(element_fragment.min_value))
-                        max_exp = int(math.log2(element_fragment.max_value))
-                        exp = trial.suggest_int(
-                            f"{param_base}_{i}_exp", min_exp, max_exp
-                        )
-                        values.append(2**exp)
-                    elif element_type == "IntegerFragment":
-                        values.append(
-                            trial.suggest_int(
-                                f"{param_base}_{i}",
-                                element_fragment.min_value,
-                                element_fragment.max_value,
+                case PermutationFragment(length=n):
+                    # Permutation: use rank-based encoding
+                    # For each position i, we select which of the remaining elements (rank 0 to n-i-1)
+                    # This avoids the issue of dynamic categorical choices
+                    available = list(range(n))
+                    perm = []
+                    for i in range(n):
+                        if len(available) == 1:
+                            # Only one element left
+                            perm.append(available[0])
+                        else:
+                            # Suggest rank (which remaining element to pick)
+                            rank = trial.suggest_int(
+                                f"{param_base}_rank{i}", 0, len(available) - 1
                             )
-                        )
-                    elif element_type == "EnumFragment":
-                        values.append(
-                            trial.suggest_categorical(
-                                f"{param_base}_{i}", element_fragment.values
-                            )
-                        )
-                    elif element_type == "BooleanFragment":
-                        values.append(
-                            trial.suggest_categorical(f"{param_base}_{i}", [False, True])
-                        )
-                    else:
-                        # Fallback: use default
-                        values.append(element_fragment.default())
+                            selected = available[rank]
+                            perm.append(selected)
+                            available.remove(selected)
+                    flat_config.append(perm)
 
-                flat_config.append(tuple(values))
+                case ListOf(inner=inner_fragment, length=length):
+                    # List of values: suggest each independently
+                    values: list[object] = []
+                    for i in range(length):
+                        match inner_fragment:
+                            case PowerOfTwoFragment(low=low, high=high):
+                                min_exp = int(math.log2(low))
+                                max_exp = int(math.log2(high))
+                                exp = trial.suggest_int(
+                                    f"{param_base}_{i}_exp", min_exp, max_exp
+                                )
+                                values.append(2**exp)
 
-            else:
-                # Unknown fragment type: use default
-                flat_config.append(fragment.default())
+                            case IntegerFragment(low=low, high=high):
+                                values.append(
+                                    trial.suggest_int(f"{param_base}_{i}", low, high)
+                                )
+
+                            case EnumFragment(choices=choices):
+                                values.append(
+                                    trial.suggest_categorical(
+                                        f"{param_base}_{i}", choices
+                                    )
+                                )
+
+                            case BooleanFragment():
+                                values.append(
+                                    trial.suggest_categorical(
+                                        f"{param_base}_{i}", [False, True]
+                                    )
+                                )
+
+                            case _:
+                                # Fallback: use default
+                                values.append(inner_fragment.default())
+
+                    flat_config.append(values)
+
+                case _:
+                    # Unknown fragment type: use default
+                    flat_config.append(fragment.default())
 
         # Convert flat config to Config
         return self.config_gen.unflatten(flat_config)
