@@ -264,35 +264,45 @@ class OptunaSearch(BaseSearch):
         Returns:
             Suggested configuration.
         """
-        flat_config: list[object] = []
 
-        # Iterate through flat spec fragments
-        for idx, fragment in enumerate(self.config_gen.flat_spec):
-            # Use index-based parameter names
-            param_base = f"p{idx}"
+        def suggest_fragment_value(
+            fragment: (
+                PowerOfTwoFragment
+                | IntegerFragment
+                | EnumFragment
+                | BooleanFragment
+                | PermutationFragment
+            ),
+            param_name: str,
+        ) -> object:
+            """Suggest a value for a single fragment.
 
+            Args:
+                fragment: The fragment to suggest a value for.
+                param_name: The parameter name to use for Optuna.
+
+            Returns:
+                The suggested value.
+            """
             match fragment:
                 case PowerOfTwoFragment(low=low, high=high):
                     # Power of two: suggest in log space
                     min_exp = int(math.log2(low))
                     max_exp = int(math.log2(high))
-                    exp = trial.suggest_int(f"{param_base}_exp", min_exp, max_exp)
-                    flat_config.append(2**exp)
+                    exp = trial.suggest_int(f"{param_name}_exp", min_exp, max_exp)
+                    return 2**exp
 
                 case IntegerFragment(low=low, high=high):
                     # Integer range
-                    value = trial.suggest_int(param_base, low, high)
-                    flat_config.append(value)
+                    return trial.suggest_int(param_name, low, high)
 
                 case EnumFragment(choices=choices):
                     # Categorical choice
-                    value = trial.suggest_categorical(param_base, choices)
-                    flat_config.append(value)
+                    return trial.suggest_categorical(param_name, choices)
 
                 case BooleanFragment():
                     # Boolean as categorical
-                    value = trial.suggest_categorical(param_base, [False, True])
-                    flat_config.append(value)
+                    return trial.suggest_categorical(param_name, [False, True])
 
                 case PermutationFragment(length=n):
                     # Permutation: use rank-based encoding
@@ -307,54 +317,36 @@ class OptunaSearch(BaseSearch):
                         else:
                             # Suggest rank (which remaining element to pick)
                             rank = trial.suggest_int(
-                                f"{param_base}_rank{i}", 0, len(available) - 1
+                                f"{param_name}_rank{i}", 0, len(available) - 1
                             )
                             selected = available[rank]
                             perm.append(selected)
                             available.remove(selected)
-                    flat_config.append(perm)
+                    return perm
 
+                case _:
+                    # Fallback: use default
+                    return fragment.default()
+
+        flat_config: list[object] = []
+
+        # Iterate through flat spec fragments
+        for idx, fragment in enumerate(self.config_gen.flat_spec):
+            # Use index-based parameter names
+            param_base = f"p{idx}"
+
+            match fragment:
                 case ListOf(inner=inner_fragment, length=length):
                     # List of values: suggest each independently
-                    values: list[object] = []
-                    for i in range(length):
-                        match inner_fragment:
-                            case PowerOfTwoFragment(low=low, high=high):
-                                min_exp = int(math.log2(low))
-                                max_exp = int(math.log2(high))
-                                exp = trial.suggest_int(
-                                    f"{param_base}_{i}_exp", min_exp, max_exp
-                                )
-                                values.append(2**exp)
-
-                            case IntegerFragment(low=low, high=high):
-                                values.append(
-                                    trial.suggest_int(f"{param_base}_{i}", low, high)
-                                )
-
-                            case EnumFragment(choices=choices):
-                                values.append(
-                                    trial.suggest_categorical(
-                                        f"{param_base}_{i}", choices
-                                    )
-                                )
-
-                            case BooleanFragment():
-                                values.append(
-                                    trial.suggest_categorical(
-                                        f"{param_base}_{i}", [False, True]
-                                    )
-                                )
-
-                            case _:
-                                # Fallback: use default
-                                values.append(inner_fragment.default())
-
+                    values = [
+                        suggest_fragment_value(inner_fragment, f"{param_base}_{i}")
+                        for i in range(length)
+                    ]
                     flat_config.append(values)
 
                 case _:
-                    # Unknown fragment type: use default
-                    flat_config.append(fragment.default())
+                    # Use the helper function for all other fragment types
+                    flat_config.append(suggest_fragment_value(fragment, param_base))
 
         # Convert flat config to Config
         return self.config_gen.unflatten(flat_config)
