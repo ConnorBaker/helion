@@ -348,6 +348,89 @@ class OptunaSearch(BaseSearch):
         # Convert flat config to Config
         return self.config_gen.unflatten(flat_config)
 
+    def _create_study(self) -> optuna.Study:
+        """Create or load an Optuna study.
+
+        Returns:
+            Configured Optuna study instance.
+        """
+        sampler = self._create_sampler()
+        pruner = self._create_pruner()
+
+        study_name = (
+            self.params.study_name or f"helion_{self.kernel.kernel.fn.__name__}"
+        )
+
+        # Log study configuration
+        self.log(f"Creating Optuna study: {study_name}")
+        self.log(f"  Sampler: {sampler.__class__.__name__}")
+        self.log(f"  Pruner: {pruner.__class__.__name__ if pruner else 'None'}")
+        self.log(f"  Storage: {self.params.storage or 'in-memory'}")
+        self.log(f"  Trials: {self.params.n_trials}")
+        self.log(f"  Batch size: {self.params.batch_size}")
+
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=self.params.storage,
+            sampler=sampler,
+            pruner=pruner,
+            direction=self.params.direction,
+            load_if_exists=self.params.load_if_exists,
+        )
+
+        # Log if resuming
+        if self.params.load_if_exists and len(study.trials) > 0:
+            self.log(
+                f"Resuming existing study with {len(study.trials)} completed trials"
+            )
+
+        return study
+
+    def _handle_trial_failure(self, trial: optuna.Trial, error: Exception) -> None:
+        """Handle a failed trial.
+
+        Args:
+            trial: The Optuna trial that failed.
+            error: The exception that caused the failure.
+
+        Raises:
+            Exception: Re-raises the error if catch_exceptions is False.
+        """
+        if self.params.catch_exceptions:
+            self.log(f"Trial {trial.number} failed: {error}")
+            self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
+        else:
+            raise error
+
+    def _report_result(self, trial: optuna.Trial, perf: float) -> None:
+        """Report a successful trial result to Optuna.
+
+        Args:
+            trial: The Optuna trial.
+            perf: Performance metric (GB/s).
+        """
+        if perf > self.best_perf_so_far:
+            self.best_perf_so_far = perf
+            self.log(f"New best: {perf:.3f} GB/s")
+
+        self.study.tell(trial, perf)
+
+    def _log_final_statistics(self) -> None:
+        """Log final optimization statistics."""
+        best_trial = self.study.best_trial
+        trials = self.study.trials
+        completed = sum(
+            1 for t in trials if t.state == optuna.trial.TrialState.COMPLETE
+        )
+        failed = sum(1 for t in trials if t.state == optuna.trial.TrialState.FAIL)
+
+        self.log("\nOptimization complete!")
+        self.log(f"  Best trial: {best_trial.number}")
+        self.log(f"  Best value: {best_trial.value:.3f} GB/s")
+        self.log(f"  Total trials: {len(trials)}")
+        self.log(f"  Completed trials: {completed}")
+        self.log(f"  Failed trials: {failed}")
+
     def _autotune(self) -> Config:
         """Run Optuna optimization using batch parallelization.
 
@@ -359,125 +442,58 @@ class OptunaSearch(BaseSearch):
         """
         import time
 
-        # Create sampler and pruner
-        sampler = self._create_sampler()
-        pruner = self._create_pruner()
+        self.study = self._create_study()
 
-        # Generate study name if not provided
-        study_name = self.params.study_name
-        if study_name is None:
-            study_name = f"helion_{self.kernel.kernel.fn.__name__}"
-
-        # Create or load study
-        self.log(f"Creating Optuna study: {study_name}")
-        self.log(f"  Sampler: {sampler.__class__.__name__}")
-        self.log(f"  Pruner: {pruner.__class__.__name__ if pruner else 'None'}")
-        self.log(f"  Storage: {self.params.storage or 'in-memory'}")
-        self.log(f"  Trials: {self.params.n_trials}")
-        self.log(f"  Batch size: {self.params.batch_size}")
-
-        self.study = optuna.create_study(
-            study_name=study_name,
-            storage=self.params.storage,
-            sampler=sampler,
-            pruner=pruner,
-            direction=self.params.direction,
-            load_if_exists=self.params.load_if_exists,
-        )
-
-        # Log if we're resuming an existing study
-        initial_trials = len(self.study.trials)
-        if self.params.load_if_exists and initial_trials > 0:
-            self.log(f"Resuming existing study with {initial_trials} completed trials")
-
-        # Track start time for timeout
         start_time = time.time()
         trials_completed = 0
 
         # Batch optimization loop
         while trials_completed < self.params.n_trials:
             # Check timeout
-            if self.params.timeout is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= self.params.timeout:
-                    self.log(f"Timeout reached after {elapsed:.1f}s")
-                    break
+            if self.params.timeout and time.time() - start_time >= self.params.timeout:
+                self.log(f"Timeout reached after {time.time() - start_time:.1f}s")
+                break
 
             # Determine batch size for this iteration
-            remaining = self.params.n_trials - trials_completed
-            current_batch_size = min(self.params.batch_size, remaining)
+            batch_size = min(
+                self.params.batch_size, self.params.n_trials - trials_completed
+            )
 
-            # Ask for a batch of trials
-            trials = [self.study.ask() for _ in range(current_batch_size)]
-
-            # Generate configs for all trials in the batch
+            # Ask for batch of trials and generate configs
             batch_trials = []
             batch_configs = []
-            for trial in trials:
+
+            for _ in range(batch_size):
+                trial = self.study.ask()
                 try:
-                    config = self._suggest_config(trial)
                     batch_trials.append(trial)
-                    batch_configs.append(config)
+                    batch_configs.append(self._suggest_config(trial))
                 except Exception as e:
-                    if self.params.catch_exceptions:
-                        self.log(f"Trial {trial.number} config generation failed: {e}")
-                        # Tell Optuna this trial failed
-                        self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
-                    else:
-                        raise
+                    batch_trials.pop()  # Remove trial since config generation failed
+                    self._handle_trial_failure(trial, e)
 
             # Benchmark all configs in parallel
-            if batch_configs:
-                results = self.parallel_benchmark(
-                    batch_configs,
-                    desc=f"Batch {trials_completed // self.params.batch_size + 1}",
-                )
+            if not batch_configs:
+                continue
 
-                # Report results back to Optuna
-                for trial, result in zip(batch_trials, results, strict=True):
-                    if result.status == "ok":
-                        # Convert performance to objective value
-                        # BaseSearch tracks GB/s (higher is better)
-                        # Optuna maximizes by default
-                        objective_value = result.perf
+            batch_num = trials_completed // self.params.batch_size + 1
+            results = self.parallel_benchmark(batch_configs, desc=f"Batch {batch_num}")
 
-                        # Update best performance tracking
-                        if objective_value > self.best_perf_so_far:
-                            self.best_perf_so_far = objective_value
-                            self.log(f"New best: {objective_value:.3f} GB/s")
+            # Report results back to Optuna
+            for trial, result in zip(batch_trials, results, strict=True):
+                match result.status:
+                    case "ok":
+                        self._report_result(trial, result.perf)
+                    case _:
+                        error = RuntimeError(
+                            f"Benchmark failed with status: {result.status}"
+                        )
+                        self._handle_trial_failure(trial, error)
 
-                        # Tell Optuna about the result
-                        self.study.tell(trial, objective_value)
-                    else:
-                        # Benchmark failed or timed out
-                        if self.params.catch_exceptions:
-                            self.log(
-                                f"Trial {trial.number} failed with status: {result.status}"
-                            )
-                            self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
-                        else:
-                            # Re-raise if not catching exceptions
-                            raise RuntimeError(
-                                f"Trial {trial.number} benchmark failed with status: {result.status}"
-                            )
+            trials_completed += len(batch_configs)
 
-                trials_completed += len(batch_configs)
-
-        # Log final statistics
-        best_trial = self.study.best_trial
-        self.log("\nOptimization complete!")
-        self.log(f"  Best trial: {best_trial.number}")
-        self.log(f"  Best value: {best_trial.value:.3f} GB/s")
-        self.log(f"  Total trials: {len(self.study.trials)}")
-        self.log(
-            f"  Completed trials: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE])}"
-        )
-        self.log(
-            f"  Failed trials: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.FAIL])}"
-        )
-
-        # Reconstruct best config
-        return self._suggest_config(best_trial)
+        self._log_final_statistics()
+        return self._suggest_config(self.study.best_trial)
 
     def get_study(self) -> optuna.Study | None:
         """Get the Optuna study object for further analysis.
