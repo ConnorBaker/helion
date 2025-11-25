@@ -78,8 +78,8 @@ class OptunaSearchParams:
         direction: Optimization direction. 'maximize' for throughput (default), 'minimize' for latency.
         show_progress_bar: Whether to show Optuna's built-in progress bar.
         catch_exceptions: If True, catch exceptions during trials and mark as failed.
-        n_jobs: Number of parallel jobs. 1 means sequential, -1 means use all CPUs.
-            Note: Helion already parallelizes compilation, so this controls trial-level parallelism.
+        batch_size: Number of trials to run in parallel per batch. Defaults to 10.
+            Set to 1 to disable batching.
     """
 
     n_trials: int = 100
@@ -94,7 +94,7 @@ class OptunaSearchParams:
     direction: str = "maximize"
     show_progress_bar: bool = True
     catch_exceptions: bool = True
-    n_jobs: int = 1
+    batch_size: int = 10
 
 
 class OptunaSearch(BaseSearch):
@@ -183,6 +183,10 @@ class OptunaSearch(BaseSearch):
         # Override study name from env if set
         if env_study := os.environ.get("HELION_AUTOTUNE_OPTUNA_STUDY"):
             self.params.study_name = env_study
+
+        # Override batch size from env if set
+        if env_batch := os.environ.get("HELION_AUTOTUNE_OPTUNA_BATCH_SIZE"):
+            self.params.batch_size = int(env_batch)
 
     def _create_sampler(self) -> BaseSampler:
         """Create Optuna sampler based on configuration.
@@ -351,50 +355,17 @@ class OptunaSearch(BaseSearch):
         # Convert flat config to Config
         return self.config_gen.unflatten(flat_config)
 
-    def _objective(self, trial: optuna.Trial) -> float:
-        """Objective function for Optuna optimization.
-
-        Args:
-            trial: Optuna trial object.
-
-        Returns:
-            Performance metric (higher is better for 'maximize', lower for 'minimize').
-
-        Raises:
-            optuna.TrialPruned: If the trial should be pruned.
-        """
-        # Suggest a configuration
-        config = self._suggest_config(trial)
-
-        try:
-            # Benchmark the configuration
-            _, perf = self.benchmark(config)
-
-            # Update best performance tracking
-            if perf > self.best_perf_so_far:
-                self.best_perf_so_far = perf
-                self.log(f"New best: {perf:.3f} GB/s")
-
-            # Return performance (GB/s by default)
-            # Optuna maximizes by default, which aligns with throughput
-            return perf
-
-        except Exception as e:
-            # If catch_exceptions is enabled, report failure and prune
-            if self.params.catch_exceptions:
-                self.log(f"Trial failed: {e}")
-                # Report a very poor performance to indicate failure
-                # Use pruning to stop the trial
-                raise optuna.TrialPruned from e
-            # Re-raise the exception
-            raise
-
     def _autotune(self) -> Config:
-        """Run Optuna optimization.
+        """Run Optuna optimization using batch parallelization.
+
+        Uses Optuna's ask-and-tell interface to batch trials and leverage
+        Helion's parallel benchmarking infrastructure for maximum performance.
 
         Returns:
             Best configuration found.
         """
+        import time
+
         # Create sampler and pruner
         sampler = self._create_sampler()
         pruner = self._create_pruner()
@@ -410,6 +381,7 @@ class OptunaSearch(BaseSearch):
         self.log(f"  Pruner: {pruner.__class__.__name__ if pruner else 'None'}")
         self.log(f"  Storage: {self.params.storage or 'in-memory'}")
         self.log(f"  Trials: {self.params.n_trials}")
+        self.log(f"  Batch size: {self.params.batch_size}")
 
         self.study = optuna.create_study(
             study_name=study_name,
@@ -421,22 +393,85 @@ class OptunaSearch(BaseSearch):
         )
 
         # Log if we're resuming an existing study
-        if self.params.load_if_exists and len(self.study.trials) > 0:
-            self.log(
-                f"Resuming existing study with {len(self.study.trials)} completed trials"
-            )
+        initial_trials = len(self.study.trials)
+        if self.params.load_if_exists and initial_trials > 0:
+            self.log(f"Resuming existing study with {initial_trials} completed trials")
 
-        # Optimize
-        self.study.optimize(
-            self._objective,
-            n_trials=self.params.n_trials,
-            timeout=self.params.timeout,
-            n_jobs=self.params.n_jobs,
-            show_progress_bar=self.params.show_progress_bar,
-            catch=(Exception,) if self.params.catch_exceptions else (),
-        )
+        # Track start time for timeout
+        start_time = time.time()
+        trials_completed = 0
 
-        # Log best trial
+        # Batch optimization loop
+        while trials_completed < self.params.n_trials:
+            # Check timeout
+            if self.params.timeout is not None:
+                elapsed = time.time() - start_time
+                if elapsed >= self.params.timeout:
+                    self.log(f"Timeout reached after {elapsed:.1f}s")
+                    break
+
+            # Determine batch size for this iteration
+            remaining = self.params.n_trials - trials_completed
+            current_batch_size = min(self.params.batch_size, remaining)
+
+            # Ask for a batch of trials
+            trials = [self.study.ask() for _ in range(current_batch_size)]
+
+            # Generate configs for all trials in the batch
+            trial_configs = []
+            for trial in trials:
+                try:
+                    config = self._suggest_config(trial)
+                    trial_configs.append((trial, config))
+                except Exception as e:
+                    if self.params.catch_exceptions:
+                        self.log(f"Trial {trial.number} config generation failed: {e}")
+                        # Tell Optuna this trial failed
+                        self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                    else:
+                        raise
+
+            # Benchmark all configs in parallel
+            if trial_configs:
+                configs = [config for _, config in trial_configs]
+                results = self.parallel_benchmark(
+                    configs,
+                    desc=f"Batch {trials_completed // self.params.batch_size + 1}",
+                )
+
+                # Report results back to Optuna
+                for (trial, _config), result in zip(
+                    trial_configs, results, strict=True
+                ):
+                    if result.status == "ok":
+                        # Convert performance to objective value
+                        # BaseSearch tracks GB/s (higher is better)
+                        # Optuna maximizes by default
+                        objective_value = result.perf
+
+                        # Update best performance tracking
+                        if objective_value > self.best_perf_so_far:
+                            self.best_perf_so_far = objective_value
+                            self.log(f"New best: {objective_value:.3f} GB/s")
+
+                        # Tell Optuna about the result
+                        self.study.tell(trial, objective_value)
+                    else:
+                        # Benchmark failed or timed out
+                        if self.params.catch_exceptions:
+                            self.log(
+                                f"Trial {trial.number} failed with status: {result.status}"
+                            )
+                            self.study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                        else:
+                            # Re-raise if not catching exceptions
+                            raise RuntimeError(
+                                f"Trial {trial.number} benchmark failed with status: {result.status}"
+                            )
+
+                trials_completed += len(trial_configs)
+
+        # Log final statistics
         best_trial = self.study.best_trial
         self.log("\nOptimization complete!")
         self.log(f"  Best trial: {best_trial.number}")
@@ -444,9 +479,6 @@ class OptunaSearch(BaseSearch):
         self.log(f"  Total trials: {len(self.study.trials)}")
         self.log(
             f"  Completed trials: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE])}"
-        )
-        self.log(
-            f"  Pruned trials: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.PRUNED])}"
         )
         self.log(
             f"  Failed trials: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.FAIL])}"
