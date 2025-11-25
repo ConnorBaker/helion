@@ -257,12 +257,14 @@ class OptunaSearch(BaseSearch):
         Returns:
             Suggested configuration.
         """
-        flat_config = {}
+        flat_config = []
 
-        # Iterate through config spec fragments
-        for param_name, fragment in self.config_spec.fragments.items():
+        # Iterate through flat spec fragments
+        for idx, fragment in enumerate(self.config_gen.flat_spec):
             # Get the type of fragment
             fragment_type = type(fragment).__name__
+            # Use index-based parameter names
+            param_base = f"p{idx}"
 
             if fragment_type == "PowerOfTwoFragment":
                 # Power of two: suggest in log space
@@ -273,26 +275,25 @@ class OptunaSearch(BaseSearch):
 
                 min_exp = int(math.log2(min_val))
                 max_exp = int(math.log2(max_val))
-                exp = trial.suggest_int(f"{param_name}_exp", min_exp, max_exp)
-                flat_config[param_name] = 2**exp
+                exp = trial.suggest_int(f"{param_base}_exp", min_exp, max_exp)
+                flat_config.append(2**exp)
 
             elif fragment_type == "IntegerFragment":
                 # Integer range
-                flat_config[param_name] = trial.suggest_int(
-                    param_name, fragment.min_value, fragment.max_value
+                value = trial.suggest_int(
+                    param_base, fragment.min_value, fragment.max_value
                 )
+                flat_config.append(value)
 
             elif fragment_type == "EnumFragment":
                 # Categorical choice
-                flat_config[param_name] = trial.suggest_categorical(
-                    param_name, fragment.values
-                )
+                value = trial.suggest_categorical(param_base, fragment.values)
+                flat_config.append(value)
 
             elif fragment_type == "BooleanFragment":
                 # Boolean as categorical
-                flat_config[param_name] = trial.suggest_categorical(
-                    param_name, [False, True]
-                )
+                value = trial.suggest_categorical(param_base, [False, True])
+                flat_config.append(value)
 
             elif fragment_type == "PermutationFragment":
                 # Permutation: use rank-based encoding
@@ -308,12 +309,12 @@ class OptunaSearch(BaseSearch):
                     else:
                         # Suggest rank (which remaining element to pick)
                         rank = trial.suggest_int(
-                            f"{param_name}_rank{i}", 0, len(available) - 1
+                            f"{param_base}_rank{i}", 0, len(available) - 1
                         )
                         selected = available[rank]
                         perm.append(selected)
                         available.remove(selected)
-                flat_config[param_name] = tuple(perm)
+                flat_config.append(tuple(perm))
 
             elif fragment_type == "ListOf":
                 # List of values: suggest each independently
@@ -328,13 +329,13 @@ class OptunaSearch(BaseSearch):
                         min_exp = int(math.log2(element_fragment.min_value))
                         max_exp = int(math.log2(element_fragment.max_value))
                         exp = trial.suggest_int(
-                            f"{param_name}_{i}_exp", min_exp, max_exp
+                            f"{param_base}_{i}_exp", min_exp, max_exp
                         )
                         values.append(2**exp)
                     elif element_type == "IntegerFragment":
                         values.append(
                             trial.suggest_int(
-                                f"{param_name}_{i}",
+                                f"{param_base}_{i}",
                                 element_fragment.min_value,
                                 element_fragment.max_value,
                             )
@@ -342,24 +343,22 @@ class OptunaSearch(BaseSearch):
                     elif element_type == "EnumFragment":
                         values.append(
                             trial.suggest_categorical(
-                                f"{param_name}_{i}", element_fragment.values
+                                f"{param_base}_{i}", element_fragment.values
                             )
                         )
                     elif element_type == "BooleanFragment":
                         values.append(
-                            trial.suggest_categorical(
-                                f"{param_name}_{i}", [False, True]
-                            )
+                            trial.suggest_categorical(f"{param_base}_{i}", [False, True])
                         )
                     else:
                         # Fallback: use default
                         values.append(element_fragment.default())
 
-                flat_config[param_name] = tuple(values)
+                flat_config.append(tuple(values))
 
             else:
                 # Unknown fragment type: use default
-                flat_config[param_name] = fragment.default()
+                flat_config.append(fragment.default())
 
         # Convert flat config to Config
         return self.config_gen.unflatten(flat_config)
