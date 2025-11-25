@@ -28,11 +28,13 @@ import math
 import os
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import Sequence
 
 from . import exc
 from .base_search import BaseSearch
 from .config_fragment import BooleanFragment
+from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
 from .config_fragment import ListOf
@@ -54,6 +56,11 @@ try:
 except ImportError as e:
     HAS_OPTUNA = False
     _IMPORT_ERROR = e
+
+
+SamplerName = Literal["tpe", "cmaes", "gp", "random", "grid"]
+PrunerName = Literal["median", "hyperband", "percentile", "threshold"]
+Direction = Literal["maximize", "minimize"]
 
 
 @dataclasses.dataclass
@@ -84,14 +91,14 @@ class OptunaSearchParams:
 
     n_trials: int = 100
     timeout: float | None = None
-    sampler: str | BaseSampler = "tpe"
+    sampler: SamplerName | BaseSampler = "tpe"
     sampler_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
-    pruner: str | Any | None = "median"
+    pruner: PrunerName | Any | None = "median"
     pruner_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
     study_name: str | None = None
     storage: str | None = None
     load_if_exists: bool = True
-    direction: str = "maximize"
+    direction: Direction = "maximize"
     show_progress_bar: bool = True
     catch_exceptions: bool = True
     batch_size: int = 10
@@ -201,28 +208,24 @@ class OptunaSearch(BaseSearch):
             # Already a sampler instance
             return self.params.sampler
 
-        sampler_name = self.params.sampler.lower()
         kwargs = self.params.sampler_kwargs
 
-        if sampler_name == "tpe":
-            return optuna.samplers.TPESampler(**kwargs)
-        if sampler_name == "cmaes":
-            return optuna.samplers.CmaEsSampler(**kwargs)
-        if sampler_name == "gp":
-            return optuna.samplers.GPSampler(**kwargs)
-        if sampler_name == "random":
-            return optuna.samplers.RandomSampler(**kwargs)
-        if sampler_name == "grid":
-            # GridSampler requires search_space parameter
-            if "search_space" not in kwargs:
-                raise ValueError(
-                    "GridSampler requires 'search_space' in sampler_kwargs"
-                )
-            return optuna.samplers.GridSampler(**kwargs)
-        raise ValueError(
-            f"Unknown sampler: {sampler_name}. "
-            f"Supported: 'tpe', 'cmaes', 'gp', 'random', 'grid'"
-        )
+        match self.params.sampler:
+            case "tpe":
+                return optuna.samplers.TPESampler(**kwargs)
+            case "cmaes":
+                return optuna.samplers.CmaEsSampler(**kwargs)
+            case "gp":
+                return optuna.samplers.GPSampler(**kwargs)
+            case "random":
+                return optuna.samplers.RandomSampler(**kwargs)
+            case "grid":
+                # GridSampler requires search_space parameter
+                if "search_space" not in kwargs:
+                    raise ValueError(
+                        "GridSampler requires 'search_space' in sampler_kwargs"
+                    )
+                return optuna.samplers.GridSampler(**kwargs)
 
     def _create_pruner(self) -> pruners.BasePruner | None:
         """Create Optuna pruner based on configuration.
@@ -240,21 +243,17 @@ class OptunaSearch(BaseSearch):
             # Already a pruner instance
             return self.params.pruner
 
-        pruner_name = self.params.pruner.lower()
         kwargs = self.params.pruner_kwargs
 
-        if pruner_name == "median":
-            return optuna.pruners.MedianPruner(**kwargs)
-        if pruner_name == "hyperband":
-            return optuna.pruners.HyperbandPruner(**kwargs)
-        if pruner_name == "percentile":
-            return optuna.pruners.PercentilePruner(**kwargs)
-        if pruner_name == "threshold":
-            return optuna.pruners.ThresholdPruner(**kwargs)
-        raise ValueError(
-            f"Unknown pruner: {pruner_name}. "
-            f"Supported: 'median', 'hyperband', 'percentile', 'threshold', None"
-        )
+        match self.params.pruner:
+            case "median":
+                return optuna.pruners.MedianPruner(**kwargs)
+            case "hyperband":
+                return optuna.pruners.HyperbandPruner(**kwargs)
+            case "percentile":
+                return optuna.pruners.PercentilePruner(**kwargs)
+            case "threshold":
+                return optuna.pruners.ThresholdPruner(**kwargs)
 
     def _suggest_config(self, trial: optuna.Trial) -> Config:
         """Suggest a configuration using Optuna trial.
@@ -270,13 +269,7 @@ class OptunaSearch(BaseSearch):
         """
 
         def suggest_fragment_value(
-            fragment: (
-                PowerOfTwoFragment
-                | IntegerFragment
-                | EnumFragment
-                | BooleanFragment
-                | PermutationFragment
-            ),
+            fragment: ConfigSpecFragment,
             param_name: str,
         ) -> object:
             """Suggest a value for a single fragment.
@@ -418,11 +411,13 @@ class OptunaSearch(BaseSearch):
             trials = [self.study.ask() for _ in range(current_batch_size)]
 
             # Generate configs for all trials in the batch
-            trial_configs = []
+            batch_trials = []
+            batch_configs = []
             for trial in trials:
                 try:
                     config = self._suggest_config(trial)
-                    trial_configs.append((trial, config))
+                    batch_trials.append(trial)
+                    batch_configs.append(config)
                 except Exception as e:
                     if self.params.catch_exceptions:
                         self.log(f"Trial {trial.number} config generation failed: {e}")
@@ -432,17 +427,14 @@ class OptunaSearch(BaseSearch):
                         raise
 
             # Benchmark all configs in parallel
-            if trial_configs:
-                configs = [config for _, config in trial_configs]
+            if batch_configs:
                 results = self.parallel_benchmark(
-                    configs,
+                    batch_configs,
                     desc=f"Batch {trials_completed // self.params.batch_size + 1}",
                 )
 
                 # Report results back to Optuna
-                for (trial, _config), result in zip(
-                    trial_configs, results, strict=True
-                ):
+                for trial, result in zip(batch_trials, results, strict=True):
                     if result.status == "ok":
                         # Convert performance to objective value
                         # BaseSearch tracks GB/s (higher is better)
@@ -469,7 +461,7 @@ class OptunaSearch(BaseSearch):
                                 f"Trial {trial.number} benchmark failed with status: {result.status}"
                             )
 
-                trials_completed += len(trial_configs)
+                trials_completed += len(batch_configs)
 
         # Log final statistics
         best_trial = self.study.best_trial
