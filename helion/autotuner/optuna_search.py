@@ -435,7 +435,9 @@ class OptunaSearch(BaseSearch):
         """Run Optuna optimization using batch parallelization.
 
         Uses Optuna's ask-and-tell interface to batch trials and leverage
-        Helion's parallel benchmarking infrastructure for maximum performance.
+        Helion's parallel benchmarking infrastructure. When autotune_precompile
+        is enabled, configs are compiled in parallel in subprocesses, maximizing
+        CPU utilization during the compilation phase.
 
         Returns:
             Best configuration found.
@@ -447,23 +449,24 @@ class OptunaSearch(BaseSearch):
         start_time = time.time()
         trials_completed = 0
 
-        # Batch optimization loop
-        while trials_completed < self.params.n_trials:
-            # Check timeout
-            if self.params.timeout and time.time() - start_time >= self.params.timeout:
-                self.log(f"Timeout reached after {time.time() - start_time:.1f}s")
-                break
+        def prepare_batch(
+            n: int,
+        ) -> tuple[list[optuna.Trial], list[Config]] | None:
+            """Prepare a batch of trials and configs.
 
-            # Determine batch size for this iteration
-            batch_size = min(
-                self.params.batch_size, self.params.n_trials - trials_completed
-            )
+            Args:
+                n: Number of trials to prepare.
 
-            # Ask for batch of trials and generate configs
+            Returns:
+                Tuple of (trials, configs) or None if no valid configs.
+            """
+            if n <= 0:
+                return None
+
             batch_trials = []
             batch_configs = []
 
-            for _ in range(batch_size):
+            for _ in range(n):
                 trial = self.study.ask()
                 try:
                     batch_trials.append(trial)
@@ -472,15 +475,36 @@ class OptunaSearch(BaseSearch):
                     batch_trials.pop()  # Remove trial since config generation failed
                     self._handle_trial_failure(trial, e)
 
-            # Benchmark all configs in parallel
-            if not batch_configs:
-                continue
+            return (batch_trials, batch_configs) if batch_configs else None
 
+        # Batch optimization loop
+        batch_size = min(self.params.batch_size, self.params.n_trials)
+        current_batch = prepare_batch(batch_size)
+
+        while current_batch is not None:
+            # Check timeout
+            if self.params.timeout and time.time() - start_time >= self.params.timeout:
+                self.log(f"Timeout reached after {time.time() - start_time:.1f}s")
+                break
+
+            current_trials, current_configs = current_batch
+
+            # Prepare next batch
+            remaining = self.params.n_trials - trials_completed - len(current_configs)
+            next_batch_size = min(self.params.batch_size, remaining)
+            next_batch = prepare_batch(next_batch_size) if next_batch_size > 0 else None
+
+            # Benchmark current batch
+            # parallel_benchmark handles compilation and benchmarking:
+            # 1. Compiles all configs (in parallel if autotune_precompile is set)
+            # 2. Benchmarks sequentially to avoid noisy results
             batch_num = trials_completed // self.params.batch_size + 1
-            results = self.parallel_benchmark(batch_configs, desc=f"Batch {batch_num}")
+            results = self.parallel_benchmark(
+                current_configs, desc=f"Batch {batch_num}"
+            )
 
             # Report results back to Optuna
-            for trial, result in zip(batch_trials, results, strict=True):
+            for trial, result in zip(current_trials, results, strict=True):
                 match result.status:
                     case "ok":
                         self._report_result(trial, result.perf)
@@ -490,7 +514,8 @@ class OptunaSearch(BaseSearch):
                         )
                         self._handle_trial_failure(trial, error)
 
-            trials_completed += len(batch_configs)
+            trials_completed += len(current_configs)
+            current_batch = next_batch
 
         self._log_final_statistics()
         return self._suggest_config(self.study.best_trial)
