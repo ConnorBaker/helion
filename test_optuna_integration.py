@@ -63,10 +63,12 @@ def test_optuna_basic_kernel() -> None:
     # Bind the kernel
     bound = add.bind((a, b))
 
-    # Create OptunaSearch directly
+    # Create OptunaSearch directly with unique study name
     params = OptunaSearchParams(
         n_trials=5,
         sampler="tpe",
+        study_name="test_direct_instantiation",
+        load_if_exists=False,  # Don't resume from previous test
         show_progress_bar=False,  # Don't clutter output
     )
     autotuner = OptunaSearch(bound, (a, b), params=params)
@@ -88,6 +90,8 @@ def test_optuna_basic_kernel() -> None:
         params = OptunaSearchParams(
             n_trials=3,
             sampler=sampler_name,
+            study_name=f"test_sampler_{sampler_name}",
+            load_if_exists=False,
             show_progress_bar=False,
         )
         autotuner = OptunaSearch(bound, (a, b), params=params)
