@@ -449,8 +449,6 @@ class OptunaSearch(BaseSearch):
         Raises:
             InvalidAPIUsage: If pipelining is enabled but device is not a GPU.
         """
-        from itertools import starmap
-        import math
         import time
 
         # Pipelining only makes sense on GPU (CPU compilation overlapping GPU benchmarking)
@@ -529,112 +527,39 @@ class OptunaSearch(BaseSearch):
                 )
 
         else:
-            # Pipelined mode: manually manage compilation and benchmarking
-            from .base_search import BenchmarkResult
-            from .base_search import PrecompileFuture
+            # Pipelined mode: use generic pipelining infrastructure
+            from .pipeline import PipelineCallbacks
+            from .pipeline import PipelinedBatchExecutor
 
-            @dataclasses.dataclass
-            class PipelineBatch:
-                """State for a batch in the compilation/benchmarking pipeline."""
-
-                trials: list[optuna.Trial]
-                configs: list[Config]
-                fns: list[object]
-                futures: list[PrecompileFuture]
-
-            def start_compilation(
-                trials: list[optuna.Trial], configs: list[Config]
-            ) -> PipelineBatch:
-                """Start compiling a batch of configs."""
-                fns = [
-                    self.kernel.compile_config(cfg, allow_print=False)
-                    for cfg in configs
-                ]
-                futures = list(
-                    starmap(
-                        self.start_precompile_and_check_for_hangs,
-                        zip(configs, fns, strict=True),
-                    )
-                )
-                return PipelineBatch(trials, configs, fns, futures)
-
-            def benchmark_batch(
-                batch: PipelineBatch, is_working: list[bool]
-            ) -> list[BenchmarkResult]:
-                """Benchmark a compiled batch."""
-                results = []
-                for idx, (fn, ok, future) in enumerate(
-                    zip(batch.fns, is_working, batch.futures, strict=True)
-                ):
-                    config = batch.configs[idx]
-                    compile_time = (
-                        future.elapsed
-                        if future.process is not None and future.started
-                        else None
-                    )
-
-                    if ok:
-                        perf = self.benchmark_function(config, fn)
-                        status = "ok" if math.isfinite(perf) else "error"
-                    else:
-                        perf = math.inf
-                        status = (
-                            "timeout" if future.failure_reason == "timeout" else "error"
-                        )
-
-                    results.append(
-                        BenchmarkResult(
-                            config=config,
-                            fn=fn,
-                            perf=perf,
-                            status=status,
-                            compile_time=compile_time,
-                        )
-                    )
-                return results
-
-            # Start pipeline with first batch
-            first_batch = prepare_batch(
-                min(self.params.batch_size, self.params.n_trials)
-            )
-            if not first_batch:
-                self._log_final_statistics()
-                return self._suggest_config(self.study.best_trial)
-
-            pending = start_compilation(*first_batch)
-
-            while not is_timeout():
-                # Prepare next batch
-                remaining = (
-                    self.params.n_trials - trials_completed - len(pending.configs)
-                )
-                next_batch = (
-                    prepare_batch(min(self.params.batch_size, remaining))
-                    if remaining > 0
-                    else None
+            def prepare_pipeline_batch(
+                batch_size: int, completed: int
+            ) -> tuple[list[optuna.Trial], list[Config]] | None:
+                """Prepare batch for pipeline execution."""
+                remaining = self.params.n_trials - completed
+                return (
+                    prepare_batch(min(batch_size, remaining)) if remaining > 0 else None
                 )
 
-                # Wait for current batch compilation
-                batch_num = trials_completed // self.params.batch_size + 1
-                desc = (
+            def get_batch_description(batch_num: int, completed: int) -> str | None:
+                """Get progress bar description for a batch."""
+                return (
                     f"Batch {batch_num} precompiling"
                     if self.settings.autotune_progress_bar
                     else None
                 )
-                is_working = PrecompileFuture.wait_for_all(pending.futures, desc=desc)
 
-                # Start next batch compilation NOW (overlaps with benchmarking)
-                next_pending = start_compilation(*next_batch) if next_batch else None
+            # Create pipeline callbacks
+            callbacks = PipelineCallbacks(
+                prepare_batch=prepare_pipeline_batch,
+                report_results=report_batch,
+                should_continue=lambda completed: not is_timeout()
+                and completed < self.params.n_trials,
+                get_batch_description=get_batch_description,
+            )
 
-                # Benchmark current batch while next compiles
-                results = benchmark_batch(pending, is_working)
-                report_batch(pending.trials, results)
-
-                trials_completed += len(pending.configs)
-
-                if next_pending is None:
-                    break
-                pending = next_pending
+            # Run pipelined execution
+            executor = PipelinedBatchExecutor(self, callbacks)
+            trials_completed = executor.run(self.params.batch_size)
 
         self._log_final_statistics()
         return self._suggest_config(self.study.best_trial)
