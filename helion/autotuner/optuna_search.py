@@ -432,16 +432,22 @@ class OptunaSearch(BaseSearch):
         self.log(f"  Failed trials: {failed}")
 
     def _autotune(self) -> Config:
-        """Run Optuna optimization using batch parallelization.
+        """Run Optuna optimization with pipelined compilation and benchmarking.
 
-        Uses Optuna's ask-and-tell interface to batch trials and leverage
-        Helion's parallel benchmarking infrastructure. When autotune_precompile
-        is enabled, configs are compiled in parallel in subprocesses, maximizing
-        CPU utilization during the compilation phase.
+        Uses Optuna's ask-and-tell interface with true pipelining to maximize
+        GPU and CPU utilization simultaneously:
+
+        - Compiles batch N+1 (CPU-bound, parallel in subprocesses)
+        - While benchmarking batch N sequentially (GPU-bound)
+        - Achieves overlap to keep both resources busy
+
+        When autotune_precompile is disabled, falls back to simple batching.
 
         Returns:
             Best configuration found.
         """
+        from itertools import starmap
+        import math
         import time
 
         self.study = self._create_study()
@@ -452,14 +458,7 @@ class OptunaSearch(BaseSearch):
         def prepare_batch(
             n: int,
         ) -> tuple[list[optuna.Trial], list[Config]] | None:
-            """Prepare a batch of trials and configs.
-
-            Args:
-                n: Number of trials to prepare.
-
-            Returns:
-                Tuple of (trials, configs) or None if no valid configs.
-            """
+            """Prepare a batch of trials and configs."""
             if n <= 0:
                 return None
 
@@ -472,50 +471,181 @@ class OptunaSearch(BaseSearch):
                     batch_trials.append(trial)
                     batch_configs.append(self._suggest_config(trial))
                 except Exception as e:
-                    batch_trials.pop()  # Remove trial since config generation failed
+                    batch_trials.pop()
                     self._handle_trial_failure(trial, e)
 
             return (batch_trials, batch_configs) if batch_configs else None
 
-        # Batch optimization loop
-        batch_size = min(self.params.batch_size, self.params.n_trials)
-        current_batch = prepare_batch(batch_size)
+        # If precompilation is disabled, use simple batching
+        if not self.settings.autotune_precompile:
+            batch_size = min(self.params.batch_size, self.params.n_trials)
+            current_batch = prepare_batch(batch_size)
 
-        while current_batch is not None:
-            # Check timeout
-            if self.params.timeout and time.time() - start_time >= self.params.timeout:
-                self.log(f"Timeout reached after {time.time() - start_time:.1f}s")
-                break
+            while current_batch is not None:
+                if (
+                    self.params.timeout
+                    and time.time() - start_time >= self.params.timeout
+                ):
+                    break
 
-            current_trials, current_configs = current_batch
+                current_trials, current_configs = current_batch
+                remaining = (
+                    self.params.n_trials - trials_completed - len(current_configs)
+                )
+                next_batch = (
+                    prepare_batch(min(self.params.batch_size, remaining))
+                    if remaining > 0
+                    else None
+                )
 
-            # Prepare next batch
-            remaining = self.params.n_trials - trials_completed - len(current_configs)
-            next_batch_size = min(self.params.batch_size, remaining)
-            next_batch = prepare_batch(next_batch_size) if next_batch_size > 0 else None
+                batch_num = trials_completed // self.params.batch_size + 1
+                results = self.parallel_benchmark(
+                    current_configs, desc=f"Batch {batch_num}"
+                )
 
-            # Benchmark current batch
-            # parallel_benchmark handles compilation and benchmarking:
-            # 1. Compiles all configs (in parallel if autotune_precompile is set)
-            # 2. Benchmarks sequentially to avoid noisy results
-            batch_num = trials_completed // self.params.batch_size + 1
-            results = self.parallel_benchmark(
-                current_configs, desc=f"Batch {batch_num}"
-            )
+                for trial, result in zip(current_trials, results, strict=True):
+                    match result.status:
+                        case "ok":
+                            self._report_result(trial, result.perf)
+                        case _:
+                            self._handle_trial_failure(
+                                trial,
+                                RuntimeError(f"Benchmark failed: {result.status}"),
+                            )
 
-            # Report results back to Optuna
-            for trial, result in zip(current_trials, results, strict=True):
-                match result.status:
-                    case "ok":
-                        self._report_result(trial, result.perf)
-                    case _:
-                        error = RuntimeError(
-                            f"Benchmark failed with status: {result.status}"
+                trials_completed += len(current_configs)
+                current_batch = next_batch
+
+        else:
+            # Pipelined mode: manually manage compilation and benchmarking
+            from .base_search import BenchmarkResult
+            from .base_search import PrecompileFuture
+
+            batch_size = min(self.params.batch_size, self.params.n_trials)
+            current_batch = prepare_batch(batch_size)
+
+            # Compile first batch immediately
+            pending_trials: list[optuna.Trial] | None = None
+            pending_configs: list[Config] | None = None
+            pending_fns: list[object] | None = None
+            pending_futures: list[PrecompileFuture] | None = None
+
+            if current_batch:
+                current_trials, current_configs = current_batch
+                pending_trials = current_trials
+                pending_configs = current_configs
+                # Start compilation
+                pending_fns = [
+                    self.kernel.compile_config(cfg, allow_print=False)
+                    for cfg in current_configs
+                ]
+                pending_futures = list(
+                    starmap(
+                        self.start_precompile_and_check_for_hangs,
+                        zip(current_configs, pending_fns, strict=True),
+                    )
+                )
+
+            while pending_futures is not None:
+                if (
+                    self.params.timeout
+                    and time.time() - start_time >= self.params.timeout
+                ):
+                    break
+
+                # Prepare next batch while current compiles
+                remaining = (
+                    self.params.n_trials - trials_completed - len(pending_configs)  # type: ignore[arg-type]
+                )
+                next_batch = (
+                    prepare_batch(min(self.params.batch_size, remaining))
+                    if remaining > 0
+                    else None
+                )
+
+                # Wait for current batch compilation to finish
+                batch_num = trials_completed // self.params.batch_size + 1
+                desc = (
+                    f"Batch {batch_num} precompiling"
+                    if self.settings.autotune_progress_bar
+                    else None
+                )
+                is_working = PrecompileFuture.wait_for_all(pending_futures, desc=desc)
+
+                # Start compiling next batch NOW (while we benchmark current)
+                next_fns: list[object] | None = None
+                next_futures: list[PrecompileFuture] | None = None
+                if next_batch:
+                    next_trials, next_configs = next_batch
+                    next_fns = [
+                        self.kernel.compile_config(cfg, allow_print=False)
+                        for cfg in next_configs
+                    ]
+                    next_futures = list(
+                        starmap(
+                            self.start_precompile_and_check_for_hangs,
+                            zip(next_configs, next_fns, strict=True),
                         )
-                        self._handle_trial_failure(trial, error)
+                    )
 
-            trials_completed += len(current_configs)
-            current_batch = next_batch
+                # Benchmark current batch (overlaps with next batch compilation!)
+                results: list[BenchmarkResult] = []
+                for idx, (fn, ok, future) in enumerate(
+                    zip(pending_fns, is_working, pending_futures, strict=True)  # type: ignore[arg-type]
+                ):
+                    config = pending_configs[idx]  # type: ignore[index]
+                    compile_time = (
+                        future.elapsed
+                        if future.process is not None and future.started
+                        else None
+                    )
+
+                    if ok:
+                        perf = self.benchmark_function(config, fn)
+                        status = "ok" if math.isfinite(perf) else "error"
+                        results.append(
+                            BenchmarkResult(
+                                config=config,
+                                fn=fn,
+                                perf=perf,
+                                status=status,
+                                compile_time=compile_time,
+                            )
+                        )
+                    else:
+                        status = (
+                            "timeout" if future.failure_reason == "timeout" else "error"
+                        )
+                        results.append(
+                            BenchmarkResult(
+                                config=config,
+                                fn=fn,
+                                perf=math.inf,
+                                status=status,
+                                compile_time=compile_time,
+                            )
+                        )
+
+                # Report results
+                for trial, result in zip(pending_trials, results, strict=True):  # type: ignore[arg-type]
+                    match result.status:
+                        case "ok":
+                            self._report_result(trial, result.perf)
+                        case _:
+                            self._handle_trial_failure(
+                                trial,
+                                RuntimeError(f"Benchmark failed: {result.status}"),
+                            )
+
+                trials_completed += len(pending_configs)  # type: ignore[arg-type]
+
+                # Move to next batch
+                if next_batch:
+                    pending_trials, pending_configs = next_batch
+                    pending_fns = next_fns
+                    pending_futures = next_futures
+                else:
+                    pending_futures = None
 
         self._log_final_statistics()
         return self._suggest_config(self.study.best_trial)
