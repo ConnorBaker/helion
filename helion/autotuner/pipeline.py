@@ -6,6 +6,48 @@ where batch N+1 compilation (CPU-bound) overlaps with batch N benchmarking
 
 The pipelining approach is applicable to any batched search algorithm and can
 significantly reduce total autotuning time by keeping both CPU and GPU busy.
+
+Example Usage:
+--------------
+Any search algorithm inheriting from BaseSearch can use pipelining:
+
+    from helion.autotuner import PipelineCallbacks, PipelinedBatchExecutor
+
+    class MyCustomSearch(BaseSearch):
+        def _autotune(self) -> Config:
+            # Check device supports pipelining
+            if self.settings.autotune_precompile:
+                if self.kernel.env.device.type != "cuda":
+                    raise exc.InvalidAPIUsage("Pipelining requires CUDA device")
+
+            # Define how to prepare batches
+            def prepare_batch(batch_size: int, completed: int) -> tuple[list, list[Config]] | None:
+                if completed >= self.max_trials:
+                    return None
+                # Generate trials/requests and configs for this batch
+                trials = [...]  # Your trial objects
+                configs = [...]  # Corresponding configs
+                return trials, configs
+
+            # Define how to report results
+            def report_results(trials: list, results: Sequence[BenchmarkResult]) -> None:
+                for trial, result in zip(trials, results):
+                    # Update your search algorithm state
+                    self.update_with_result(trial, result)
+
+            # Create callbacks
+            callbacks = PipelineCallbacks(
+                prepare_batch=prepare_batch,
+                report_results=report_results,
+                should_continue=lambda completed: completed < self.max_trials,
+                get_batch_description=lambda batch_num, completed: f"Batch {batch_num}"
+            )
+
+            # Run pipelined execution
+            executor = PipelinedBatchExecutor(self, callbacks)
+            trials_completed = executor.run(batch_size=10)
+
+            return self.get_best_config()
 """
 
 from __future__ import annotations
