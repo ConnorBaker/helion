@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Simple integration test for OptunaSearch autotuner.
 
 This script tests that OptunaSearch can be imported, instantiated, and run
@@ -16,17 +15,17 @@ import sys
 import torch
 
 import helion
-import helion.language as hl
 from helion.autotuner import OptunaSearch
 from helion.autotuner import OptunaSearchParams
+import helion.language as hl
 
 
-def test_optuna_import():
+def test_optuna_import() -> None:
     """Test that OptunaSearch can be imported."""
     print("✓ OptunaSearch imported successfully")
 
 
-def test_optuna_basic_kernel():
+def test_optuna_basic_kernel() -> None:
     """Test OptunaSearch on a simple vector addition kernel."""
     print("\nTesting OptunaSearch on vector addition kernel...")
 
@@ -59,6 +58,7 @@ def test_optuna_basic_kernel():
     # Test direct instantiation
     print("\n2. Testing direct instantiation...")
     del os.environ["HELION_AUTOTUNER"]
+    del os.environ["HELION_AUTOTUNE_OPTUNA_TRIALS"]
 
     # Bind the kernel
     bound = add.bind((a, b))
@@ -91,13 +91,13 @@ def test_optuna_basic_kernel():
             show_progress_bar=False,
         )
         autotuner = OptunaSearch(bound, (a, b), params=params)
-        config = autotuner.autotune()
+        autotuner.autotune()
         print(f"   ✓ {sampler_name} sampler works")
 
     print("\n✓ All OptunaSearch tests passed!")
 
 
-def test_optuna_persistence():
+def test_optuna_persistence() -> None:
     """Test that Optuna study persistence works."""
     print("\n4. Testing study persistence...")
 
@@ -151,7 +151,9 @@ def test_optuna_persistence():
         n_trials_2 = len(study2.trials)
         print(f"   Second run: {n_trials_2} trials total")
 
-        assert n_trials_2 == n_trials_1 + 2, f"Expected {n_trials_1 + 2} trials, got {n_trials_2}"
+        assert n_trials_2 == n_trials_1 + 2, (
+            f"Expected {n_trials_1 + 2} trials, got {n_trials_2}"
+        )
         print("✓ Study persistence works correctly")
 
     finally:
@@ -162,7 +164,7 @@ def test_optuna_persistence():
             os.unlink(db_path)
 
 
-def main():
+def main() -> int:
     """Run all tests."""
     print("=" * 60)
     print("OptunaSearch Integration Tests")

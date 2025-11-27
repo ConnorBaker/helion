@@ -56,23 +56,17 @@ import dataclasses
 import math
 from typing import TYPE_CHECKING
 from typing import Callable
-from typing import Generic
 from typing import Sequence
-from typing import TypeVar
 
 if TYPE_CHECKING:
+    from ..runtime.config import Config
     from .base_search import BaseSearch
     from .base_search import BenchmarkResult
     from .base_search import PrecompileFuture
-    from .config import Config
-
-
-# Generic type for trial/request objects (e.g., optuna.Trial, or any custom type)
-T = TypeVar("T")
 
 
 @dataclasses.dataclass
-class CompilationBatch(Generic[T]):
+class CompilationBatch[T]:
     """State for a batch in the compilation/benchmarking pipeline.
 
     This dataclass holds all the state needed to track a batch through
@@ -96,7 +90,7 @@ class CompilationBatch(Generic[T]):
 
 
 @dataclasses.dataclass
-class PipelineCallbacks(Generic[T]):
+class PipelineCallbacks[T]:
     """Callbacks for customizing the pipelined execution.
 
     These callbacks allow different search algorithms to integrate with
@@ -135,7 +129,7 @@ class PipelineCallbacks(Generic[T]):
     )
 
 
-class PipelinedBatchExecutor(Generic[T]):
+class PipelinedBatchExecutor[T]:
     """Executor for pipelined compilation and benchmarking.
 
     This class implements the core pipelining logic that can be reused across

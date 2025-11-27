@@ -31,7 +31,7 @@ from typing import Any
 from typing import Literal
 from typing import Sequence
 
-from . import exc
+from .. import exc
 from .base_search import BaseSearch
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -46,8 +46,8 @@ if TYPE_CHECKING:
     from optuna import pruners
     from optuna.samplers import BaseSampler
 
+    from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
-    from .config import Config
 
 try:
     import optuna
