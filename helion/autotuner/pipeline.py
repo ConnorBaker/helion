@@ -255,8 +255,10 @@ class PipelinedBatchExecutor[T]:
         pending = self._start_compilation(*first_batch)
 
         while self.callbacks.should_continue(trials_completed):
-            # Prepare next batch
-            next_batch = self.callbacks.prepare_batch(batch_size, trials_completed)
+            # Prepare next batch (accounting for currently pending batch)
+            next_batch = self.callbacks.prepare_batch(
+                batch_size, trials_completed + len(pending.configs)
+            )
 
             # Wait for current batch compilation
             batch_num = trials_completed // batch_size + 1
