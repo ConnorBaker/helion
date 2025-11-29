@@ -7,6 +7,11 @@ where batch N+1 compilation (CPU-bound) overlaps with batch N benchmarking
 The pipelining approach is applicable to any batched search algorithm and can
 significantly reduce total autotuning time by keeping both CPU and GPU busy.
 
+This implementation uses asyncio for true asynchronous execution:
+- Configs are generated asynchronously
+- Compilation happens in parallel using thread pools
+- Benchmarking can run asynchronously (though typically sequential for accuracy)
+
 Example Usage:
 --------------
 Any search algorithm inheriting from BaseSearch can use pipelining:
@@ -43,7 +48,7 @@ Any search algorithm inheriting from BaseSearch can use pipelining:
                 get_batch_description=lambda batch_num, completed: f"Batch {batch_num}"
             )
 
-            # Run pipelined execution
+            # Run pipelined execution (blocking call that runs async internally)
             executor = PipelinedBatchExecutor(self, callbacks)
             trials_completed = executor.run(batch_size=10)
 
@@ -52,7 +57,10 @@ Any search algorithm inheriting from BaseSearch can use pipelining:
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
+from itertools import starmap
 import math
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -138,12 +146,16 @@ class PipelinedBatchExecutor[T]:
     and benchmarking to maximize CPU and GPU utilization.
 
     The pipeline works as follows:
-    1. Compiles first batch immediately
+    1. Prepares and compiles first batch asynchronously
     2. For each batch:
+       - Prepares next batch asynchronously while waiting for current compilation
        - Waits for current batch compilation to finish
        - Immediately starts next batch compilation
-       - Benchmarks current batch while next compiles in background
+       - Benchmarks current batch asynchronously while next compiles
        - Reports results to the search algorithm
+
+    All compilation happens in parallel using thread pools, and the overall
+    coordination uses asyncio for efficient resource utilization.
 
     Type Parameters:
         T: Type of trial/request objects
@@ -157,20 +169,41 @@ class PipelinedBatchExecutor[T]:
         self,
         search: BaseSearch,
         callbacks: PipelineCallbacks[T],
+        max_compile_workers: int | None = None,
     ) -> None:
         """Initialize the pipeline executor.
 
         Args:
             search: BaseSearch instance providing compilation and benchmarking.
             callbacks: Callbacks for batch preparation, result reporting, etc.
+            max_compile_workers: Maximum number of parallel compilation workers.
+                If None, defaults to min(32, (cpu_count or 1) + 4).
         """
         self.search = search
         self.callbacks = callbacks
+        self.max_compile_workers = max_compile_workers
 
-    def _start_compilation(
+    async def _compile_config_async(self, config: Config) -> object:
+        """Compile a single config asynchronously.
+
+        Args:
+            config: Configuration to compile.
+
+        Returns:
+            Compiled kernel function.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,  # Use default executor
+            self.search.kernel.compile_config,
+            config,
+            False,  # allow_print=False
+        )
+
+    async def _start_compilation(
         self, trials: list[T], configs: list[Config]
     ) -> CompilationBatch[T]:
-        """Start compiling a batch of configs.
+        """Start compiling a batch of configs in parallel.
 
         Args:
             trials: Trial/request objects for this batch.
@@ -179,19 +212,88 @@ class PipelinedBatchExecutor[T]:
         Returns:
             CompilationBatch with compilation in progress.
         """
-
-        fns: list[CompiledConfig] = [
-            self.search.kernel.compile_config(cfg, allow_print=False) for cfg in configs
-        ]
-        futures = list(
-            map(self.search.start_precompile_and_check_for_hangs, configs, fns)
+        # Compile all configs in parallel
+        fns: list[CompiledConfig] = await asyncio.gather(
+            *[self._compile_config_async(cfg) for cfg in configs]
         )
-        return CompilationBatch(trials, configs, fns, futures)
 
-    def _benchmark_batch(
+        # Start precompile futures (these spawn subprocesses)
+        futures = list(
+            starmap(
+                self.search.start_precompile_and_check_for_hangs,
+                zip(configs, fns, strict=True),
+            )
+        )
+
+        return CompilationBatch(trials, list(configs), list(fns), futures)
+
+    async def _wait_for_compilation(
+        self, batch: CompilationBatch[T], desc: str | None
+    ) -> list[bool]:
+        """Wait for a batch compilation to complete.
+
+        Args:
+            batch: CompilationBatch to wait for.
+            desc: Description for progress bar.
+
+        Returns:
+            List of booleans indicating which compilations succeeded.
+        """
+        from .base_search import PrecompileFuture
+
+        loop = asyncio.get_running_loop()
+
+        # Run the blocking wait_for_all in a thread pool
+        return await loop.run_in_executor(
+            None, PrecompileFuture.wait_for_all, batch.futures, desc
+        )
+
+    async def _benchmark_single(
+        self, config: Config, fn: object, ok: bool, future: PrecompileFuture
+    ) -> BenchmarkResult:
+        """Benchmark a single config asynchronously.
+
+        Args:
+            config: Configuration being benchmarked.
+            fn: Compiled kernel function.
+            ok: Whether compilation succeeded.
+            future: PrecompileFuture for this config.
+
+        Returns:
+            BenchmarkResult with performance metrics.
+        """
+        from .base_search import BenchmarkResult
+
+        compile_time = (
+            future.elapsed if future.process is not None and future.started else None
+        )
+
+        if ok:
+            # Run benchmark in thread pool to avoid blocking event loop
+            loop = asyncio.get_running_loop()
+            perf = await loop.run_in_executor(
+                None, self.search.benchmark_function, config, fn
+            )
+            status = "ok" if math.isfinite(perf) else "error"
+        else:
+            perf = math.inf
+            status = "timeout" if future.failure_reason == "timeout" else "error"
+
+        return BenchmarkResult(
+            config=config,
+            fn=fn,
+            perf=perf,
+            status=status,
+            compile_time=compile_time,
+        )
+
+    async def _benchmark_batch(
         self, batch: CompilationBatch[T], is_working: list[bool]
     ) -> list[BenchmarkResult]:
         """Benchmark a compiled batch.
+
+        Benchmarks are run sequentially to avoid noisy results from concurrent
+        GPU usage, but each benchmark runs asynchronously.
 
         Args:
             batch: CompilationBatch with completed compilation.
@@ -206,32 +308,12 @@ class PipelinedBatchExecutor[T]:
         for config, fn, ok, future in zip(
             batch.configs, batch.fns, is_working, batch.futures, strict=True
         ):
-            compile_time = (
-                future.elapsed
-                if future.process is not None and future.started
-                else None
-            )
-
-            if ok:
-                perf = self.search.benchmark_function(config, fn)
-                status = "ok" if math.isfinite(perf) else "error"
-            else:
-                perf = math.inf
-                status = "timeout" if future.failure_reason == "timeout" else "error"
-
-            results.append(
-                BenchmarkResult(
-                    config=config,
-                    fn=fn,
-                    perf=perf,
-                    status=status,
-                    compile_time=compile_time,
-                )
-            )
+            result = await self._benchmark_single(config, fn, ok, future)
+            results.append(result)
         return results
 
-    def run(self, batch_size: int) -> int:
-        """Run the pipelined compilation and benchmarking.
+    async def _run_async(self, batch_size: int) -> int:
+        """Run the pipelined compilation and benchmarking asynchronously.
 
         Args:
             batch_size: Number of trials per batch.
@@ -239,42 +321,87 @@ class PipelinedBatchExecutor[T]:
         Returns:
             Total number of trials completed.
         """
-        from .base_search import PrecompileFuture
-
         trials_completed = 0
 
-        # Start pipeline with first batch
+        # Prepare and start compilation of first batch
         first_batch = self.callbacks.prepare_batch(batch_size, trials_completed)
         if not first_batch:
             return 0
 
-        pending = self._start_compilation(*first_batch)
+        pending = await self._start_compilation(*first_batch)
 
         while self.callbacks.should_continue(trials_completed):
-            # Prepare next batch (accounting for currently pending batch)
-            next_batch = self.callbacks.prepare_batch(
-                batch_size, trials_completed + len(pending.configs)
+            # Prepare next batch asynchronously
+            next_batch_size = batch_size
+            next_trials_completed = trials_completed + len(pending.configs)
+            prepare_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.callbacks.prepare_batch, next_batch_size, next_trials_completed
+                )
             )
 
             # Wait for current batch compilation
             batch_num = trials_completed // batch_size + 1
             desc = self.callbacks.get_batch_description(batch_num, trials_completed)
-            is_working = PrecompileFuture.wait_for_all(pending.futures, desc=desc)
+            is_working = await self._wait_for_compilation(pending, desc)
+
+            # Get the next batch we prepared (await the task)
+            next_batch = await prepare_task
 
             # Start next batch compilation NOW (overlaps with benchmarking)
-            next_pending = self._start_compilation(*next_batch) if next_batch else None
+            if next_batch:
+                compile_task = asyncio.create_task(self._start_compilation(*next_batch))
+            else:
+                compile_task = None
 
             # Benchmark current batch while next compiles
-            results = self._benchmark_batch(pending, is_working)
-            self.callbacks.report_results(pending.trials, results)
+            results = await self._benchmark_batch(pending, is_working)
+
+            # Report results
+            await asyncio.to_thread(
+                self.callbacks.report_results, pending.trials, results
+            )
 
             trials_completed += len(pending.configs)
 
-            if next_pending is None:
+            # Wait for next batch compilation to finish
+            if compile_task is not None:
+                pending = await compile_task
+            else:
                 break
-            pending = next_pending
 
         return trials_completed
+
+    def run(self, batch_size: int) -> int:
+        """Run the pipelined compilation and benchmarking.
+
+        This is a synchronous wrapper around the async implementation.
+
+        Args:
+            batch_size: Number of trials per batch.
+
+        Returns:
+            Total number of trials completed.
+        """
+        # Set up thread pool for compilation
+        if self.max_compile_workers is not None:
+            executor = ThreadPoolExecutor(max_workers=self.max_compile_workers)
+        else:
+            executor = None
+
+        try:
+            # Set the default executor for run_in_executor
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            if executor is not None:
+                loop.set_default_executor(executor)
+
+            # Run the async pipeline
+            return loop.run_until_complete(self._run_async(batch_size))
+        finally:
+            loop.close()
+            if executor is not None:
+                executor.shutdown(wait=True)
 
 
 __all__ = ["CompilationBatch", "PipelineCallbacks", "PipelinedBatchExecutor"]
