@@ -471,8 +471,8 @@ class OptunaSearch(BaseSearch):
             if n <= 0:
                 return None
 
-            batch_trials = []
-            batch_configs = []
+            batch_trials: list[optuna.Trial] = []
+            batch_configs: list[Config] = []
 
             for _ in range(n):
                 trial = self.study.ask()

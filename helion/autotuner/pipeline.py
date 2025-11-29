@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from .base_search import BaseSearch
     from .base_search import BenchmarkResult
     from .base_search import PrecompileFuture
+    from helion.runtime.kernel import CompiledConfig
 
 
 @dataclasses.dataclass
@@ -178,16 +179,12 @@ class PipelinedBatchExecutor[T]:
         Returns:
             CompilationBatch with compilation in progress.
         """
-        from itertools import starmap
 
-        fns = [
+        fns: list[CompiledConfig] = [
             self.search.kernel.compile_config(cfg, allow_print=False) for cfg in configs
         ]
         futures = list(
-            starmap(
-                self.search.start_precompile_and_check_for_hangs,
-                zip(configs, fns, strict=True),
-            )
+            map(self.search.start_precompile_and_check_for_hangs, configs, fns)
         )
         return CompilationBatch(trials, configs, fns, futures)
 
@@ -205,11 +202,10 @@ class PipelinedBatchExecutor[T]:
         """
         from .base_search import BenchmarkResult
 
-        results = []
-        for idx, (fn, ok, future) in enumerate(
-            zip(batch.fns, is_working, batch.futures, strict=True)
+        results: list[BenchmarkResult] = []
+        for config, fn, ok, future in zip(
+            batch.configs, batch.fns, is_working, batch.futures, strict=True
         ):
-            config = batch.configs[idx]
             compile_time = (
                 future.elapsed
                 if future.process is not None and future.started
