@@ -17,12 +17,12 @@ from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
-from .optuna_search import OptunaSearch as OptunaSearch
-from .optuna_search import OptunaSearchParams as OptunaSearchParams
+from .optuna.search import OptunaSearch as OptunaSearch
+from .optuna.search import OptunaSearchParams as OptunaSearchParams
 from .pattern_search import PatternSearch as PatternSearch
-from .pipeline import CompilationBatch as CompilationBatch
-from .pipeline import PipelineCallbacks as PipelineCallbacks
-from .pipeline import PipelinedBatchExecutor as PipelinedBatchExecutor
+from .pipeline import ConfigInFlight as ConfigInFlight
+from .pipeline import StreamCallbacks as StreamCallbacks
+from .pipeline import StreamExecutor as StreamExecutor
 from .random_search import RandomSearch as RandomSearch
 from .surrogate_pattern_search import LFBOPatternSearch
 

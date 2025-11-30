@@ -95,3 +95,6 @@ venv
 .watchman
 .watchmanconfig
 *.zip
+.direnv
+.claude
+.pytest_cache

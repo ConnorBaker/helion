@@ -1,22 +1,26 @@
 """Generic pipelined compilation and benchmarking infrastructure.
 
-This module provides reusable components for implementing pipelined autotuning,
-where batch N+1 compilation (CPU-bound) overlaps with batch N benchmarking
-(GPU-bound) to maximize hardware utilization.
+This module provides reusable components for implementing pipelined autotuning
+with stream processing, where configs are generated, compiled, and benchmarked
+out of order to maximize hardware utilization.
 
-The pipelining approach is applicable to any batched search algorithm and can
-significantly reduce total autotuning time by keeping both CPU and GPU busy.
+The stream processing approach enables:
+- Configs generated on-demand without fixed batches
+- Immediate compilation when config is generated
+- Immediate benchmarking when compilation completes
+- Immediate result reporting when benchmarking completes
+- Concurrent execution with separate controls for exploration and compilation parallelism
 
 This implementation uses asyncio for true asynchronous execution:
-- Configs are generated asynchronously
-- Compilation happens in parallel using thread pools
-- Benchmarking can run asynchronously (though typically sequential for accuracy)
+- Configs are generated asynchronously up to max_configs_ahead limit (exploration control)
+- Compilation happens in parallel using thread pools (limited by autotune_precompile_jobs)
+- Benchmarking runs asynchronously (sequential per-config for accuracy)
 
 Example Usage:
 --------------
-Any search algorithm inheriting from BaseSearch can use pipelining:
+Any search algorithm inheriting from BaseSearch can use stream processing:
 
-    from helion.autotuner import PipelineCallbacks, PipelinedBatchExecutor
+    from helion.autotuner import StreamCallbacks, StreamExecutor
 
     class MyCustomSearch(BaseSearch):
         def _autotune(self) -> Config:
@@ -25,32 +29,29 @@ Any search algorithm inheriting from BaseSearch can use pipelining:
                 if self.kernel.env.device.type != "cuda":
                     raise exc.InvalidAPIUsage("Pipelining requires CUDA device")
 
-            # Define how to prepare batches
-            def prepare_batch(batch_size: int, completed: int) -> tuple[list, list[Config]] | None:
+            # Define how to generate next config
+            def generate_next(completed: int) -> tuple[object, Config] | None:
                 if completed >= self.max_trials:
                     return None
-                # Generate trials/requests and configs for this batch
-                trials = [...]  # Your trial objects
-                configs = [...]  # Corresponding configs
-                return trials, configs
+                trial = ...  # Your trial object
+                config = ...  # Corresponding config
+                return trial, config
 
-            # Define how to report results
-            def report_results(trials: list, results: Sequence[BenchmarkResult]) -> None:
-                for trial, result in zip(trials, results):
-                    # Update your search algorithm state
-                    self.update_with_result(trial, result)
+            # Define how to report a single result
+            def report_result(trial: object, result: BenchmarkResult) -> None:
+                # Update your search algorithm state
+                self.update_with_result(trial, result)
 
             # Create callbacks
-            callbacks = PipelineCallbacks(
-                prepare_batch=prepare_batch,
-                report_results=report_results,
+            callbacks = StreamCallbacks(
+                generate_next=generate_next,
+                report_result=report_result,
                 should_continue=lambda completed: completed < self.max_trials,
-                get_batch_description=lambda batch_num, completed: f"Batch {batch_num}"
             )
 
-            # Run pipelined execution (blocking call that runs async internally)
-            executor = PipelinedBatchExecutor(self, callbacks)
-            trials_completed = executor.run(batch_size=10)
+            # Run stream execution (blocking call that runs async internally)
+            executor = StreamExecutor(self, callbacks, max_configs_ahead=20)
+            trials_completed = executor.run()
 
             return self.get_best_config()
 """
@@ -58,206 +59,276 @@ Any search algorithm inheriting from BaseSearch can use pipelining:
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import dataclasses
-from itertools import starmap
 import math
 from typing import TYPE_CHECKING
 from typing import Callable
-from typing import Sequence
+from typing import Protocol
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
     from .base_search import BaseSearch
     from .base_search import BenchmarkResult
     from .base_search import PrecompileFuture
-    from helion.runtime.kernel import CompiledConfig
+
+
+class ProgressTracker(Protocol):
+    """Protocol for tracking progress through the pipeline stages."""
+
+    def on_config_generated(self) -> None:
+        """Called when a config is generated."""
+        ...
+
+    def on_compilation_complete(self) -> None:
+        """Called when a config finishes compilation."""
+        ...
+
+    def on_benchmark_complete(self) -> None:
+        """Called when a config finishes benchmarking."""
+        ...
 
 
 @dataclasses.dataclass
-class CompilationBatch[T]:
-    """State for a batch in the compilation/benchmarking pipeline.
+class ConfigInFlight[T]:
+    """State for a single config in the processing pipeline.
 
-    This dataclass holds all the state needed to track a batch through
-    the pipeline: the original trial/request objects, configurations,
-    compiled functions, and compilation futures.
+    This dataclass holds all state needed to track a config through
+    the stream pipeline: trial object, configuration, compilation future,
+    and compilation result.
 
     Type Parameters:
         T: Type of trial/request objects (e.g., optuna.Trial)
 
     Attributes:
-        trials: Trial or request objects for this batch.
-        configs: Configurations to be benchmarked.
-        fns: Compiled kernel functions.
-        futures: PrecompileFuture objects tracking compilation progress.
+        trial: Trial or request object for this config.
+        config: Configuration to be benchmarked.
+        fn: Compiled kernel function (set after compilation).
+        future: PrecompileFuture tracking compilation progress (set after compilation starts).
+        compile_task: Asyncio task for compilation.
     """
 
-    trials: list[T]
-    configs: list[Config]
-    fns: list[object]
-    futures: list[PrecompileFuture]
+    trial: T
+    config: Config
+    fn: object | None = None
+    future: PrecompileFuture | None = None
+    compile_task: asyncio.Task | None = None
 
 
 @dataclasses.dataclass
-class PipelineCallbacks[T]:
-    """Callbacks for customizing the pipelined execution.
+class StreamCallbacks[T]:
+    """Callbacks for customizing the stream execution.
 
     These callbacks allow different search algorithms to integrate with
-    the generic pipelining infrastructure.
+    the generic stream processing infrastructure.
 
     Type Parameters:
         T: Type of trial/request objects
 
     Attributes:
-        prepare_batch: Prepare next batch of trials and configs.
-            Called to generate the next batch to process.
-            Arguments: requested batch size, trials completed so far.
-            Returns None when no more batches are available.
+        generate_next: Generate next trial and config.
+            Called when capacity is available to start a new config.
+            Arguments: number of trials completed so far.
+            Returns None when no more configs are available.
 
-        report_results: Report results back to the search algorithm.
-            Called after benchmarking completes for a batch.
-            Arguments: trials and their corresponding results.
+        report_result: Report a single result back to the search algorithm.
+            Called immediately after benchmarking completes for a config.
+            Arguments: trial and its corresponding result.
 
         should_continue: Check if pipeline should continue.
-            Called before each batch to check for stopping conditions
-            (e.g., timeout, trial limit).
+            Called to check for stopping conditions (e.g., timeout, trial limit).
             Arguments: trials completed so far.
             Returns False to stop the pipeline.
-
-        get_batch_description: Get description for progress bar.
-            Optional callback to customize progress bar text.
-            Arguments: batch number (1-indexed), trials completed so far.
-            Returns description string or None to disable progress bar.
     """
 
-    prepare_batch: Callable[[int, int], tuple[list[T], list[Config]] | None]
-    report_results: Callable[[list[T], Sequence[BenchmarkResult]], None]
+    generate_next: Callable[[int], tuple[T, Config] | None]
+    report_result: Callable[[T, BenchmarkResult], None]
     should_continue: Callable[[int], bool]
-    get_batch_description: Callable[[int, int], str | None] = (
-        lambda batch_num, trials_completed: None
-    )
 
 
-class PipelinedBatchExecutor[T]:
-    """Executor for pipelined compilation and benchmarking.
+class StreamExecutor[T]:
+    """Executor for stream-based compilation and benchmarking.
 
-    This class implements the core pipelining logic that can be reused across
-    different search algorithms. It orchestrates the overlap of compilation
-    and benchmarking to maximize CPU and GPU utilization.
+    This class implements stream processing where configs are generated, compiled,
+    and benchmarked out of order to maximize hardware utilization. Configs flow
+    through the pipeline with separate controls for exploration and compilation parallelism.
 
-    The pipeline works as follows:
-    1. Prepares and compiles first batch asynchronously
-    2. For each batch:
-       - Prepares next batch asynchronously while waiting for current compilation
-       - Waits for current batch compilation to finish
-       - Immediately starts next batch compilation
-       - Benchmarks current batch asynchronously while next compiles
-       - Reports results to the search algorithm
+    The stream works as follows:
+    1. Generate configs on-demand up to max_configs_ahead (controls exploration vs learning)
+    2. Each config is compiled immediately upon generation (parallel, limited by _jobs)
+    3. Each config is benchmarked immediately when compilation completes
+    4. Results are reported immediately when benchmarking completes
+    5. New configs are generated as previous configs complete benchmarking
 
-    All compilation happens in parallel using thread pools, and the overall
-    coordination uses asyncio for efficient resource utilization.
+    Compilation parallelism is controlled by BaseSearch._jobs (typically CPU count),
+    while max_configs_ahead controls how far ahead to explore before learning from results.
+    The overall coordination uses asyncio for efficient resource utilization.
 
     Type Parameters:
         T: Type of trial/request objects
 
     Example:
-        >>> executor = PipelinedBatchExecutor(search_instance, callbacks)
-        >>> trials_completed = executor.run(batch_size=10)
+        >>> executor = StreamExecutor(search_instance, callbacks, max_configs_ahead=20)
+        >>> trials_completed = executor.run()
     """
 
     def __init__(
         self,
         search: BaseSearch,
-        callbacks: PipelineCallbacks[T],
-        max_compile_workers: int | None = None,
+        callbacks: StreamCallbacks[T],
+        max_configs_ahead: int = 20,
+        progress_tracker: ProgressTracker | None = None,
     ) -> None:
-        """Initialize the pipeline executor.
+        """Initialize the stream executor.
 
         Args:
             search: BaseSearch instance providing compilation and benchmarking.
-            callbacks: Callbacks for batch preparation, result reporting, etc.
-            max_compile_workers: Maximum number of parallel compilation workers.
-                If None, defaults to min(32, (cpu_count or 1) + 4).
+            callbacks: Callbacks for config generation, result reporting, etc.
+            max_configs_ahead: Maximum number of configs to generate ahead of benchmark completion.
+                Controls exploration vs exploitation tradeoff. Higher values explore more configs
+                before learning from results. Independent of compilation parallelism.
+            progress_tracker: Optional progress tracker for updating progress bars.
         """
         self.search = search
         self.callbacks = callbacks
-        self.max_compile_workers = max_compile_workers
+        self.max_configs_ahead = max_configs_ahead
+        self.progress_tracker = progress_tracker
+        # Semaphore to limit concurrent precompile subprocesses
+        # Uses the same limit as BaseSearch._jobs
+        self._precompile_semaphore: asyncio.Semaphore | None = None
+        # Track CUDA context corruption from unrecoverable errors
+        self._had_unrecoverable_error = False
 
-    async def _compile_config_async(self, config: Config) -> object:
-        """Compile a single config asynchronously.
+    def _attempt_cuda_recovery(self) -> None:
+        """Attempt to recover from CUDA context corruption.
+
+        This tries various CUDA reset operations that might help recover
+        from certain types of errors. However, for severe errors like
+        illegal memory access, the CUDA context is often unrecoverable
+        without restarting the process.
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                self.search.log(
+                    "Attempting CUDA recovery after unrecoverable error..."
+                )
+                # Try to synchronize first to clear pending operations
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass  # Expected to fail if context is corrupted
+
+                # Clear memory cache
+                torch.cuda.empty_cache()
+
+                # Reset memory stats
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.reset_accumulated_memory_stats()
+
+                # Try synchronize again to verify recovery
+                try:
+                    torch.cuda.synchronize()
+                    self.search.log(
+                        "CUDA recovery appears successful, continuing search"
+                    )
+                except Exception:
+                    self.search.log(
+                        "CUDA recovery failed - context remains corrupted"
+                    )
+        except Exception as e:
+            self.search.log(f"Error during CUDA recovery attempt: {e}")
+
+    async def _compile_and_precompile(
+        self, in_flight: ConfigInFlight[T]
+    ) -> ConfigInFlight[T]:
+        """Compile a config and start precompilation asynchronously.
 
         Args:
-            config: Configuration to compile.
+            in_flight: ConfigInFlight object with config to compile.
 
         Returns:
-            Compiled kernel function.
+            Updated ConfigInFlight with fn and future set.
         """
+        import functools
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,  # Use default executor
-            self.search.kernel.compile_config,
-            config,
-            False,  # allow_print=False
+
+        # Compile the config (allow_print is keyword-only, so use functools.partial)
+        fn = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.search.kernel.compile_config, allow_print=False
+            ),
+            in_flight.config,
         )
 
-    async def _start_compilation(
-        self, trials: list[T], configs: list[Config]
-    ) -> CompilationBatch[T]:
-        """Start compiling a batch of configs in parallel.
+        # Start precompile future (spawns subprocess)
+        future = await loop.run_in_executor(
+            None,
+            self.search.start_precompile_and_check_for_hangs,
+            in_flight.config,
+            fn,
+        )
+
+        in_flight.fn = fn
+        in_flight.future = future
+        return in_flight
+
+    async def _wait_for_precompile(self, in_flight: ConfigInFlight[T]) -> bool:
+        """Wait for precompilation to complete.
+
+        This method uses process.join() wrapped in asyncio.to_thread() to wait
+        asynchronously without polling. The join() call blocks until the process
+        completes, but running it in a thread pool allows the event loop to
+        handle other tasks concurrently.
+
+        A semaphore limits concurrent precompile subprocesses to avoid overwhelming
+        the system (similar to the _jobs cap in the batch wait_for_all).
 
         Args:
-            trials: Trial/request objects for this batch.
-            configs: Configurations to compile.
+            in_flight: ConfigInFlight with ongoing precompilation.
 
         Returns:
-            CompilationBatch with compilation in progress.
+            True if compilation succeeded, False otherwise.
         """
-        # Compile all configs in parallel
-        fns: list[CompiledConfig] = await asyncio.gather(
-            *[self._compile_config_async(cfg) for cfg in configs]
-        )
+        future = in_flight.future
+        assert future is not None
 
-        # Start precompile futures (these spawn subprocesses)
-        futures = list(
-            starmap(
-                self.search.start_precompile_and_check_for_hangs,
-                zip(configs, fns, strict=True),
-            )
-        )
+        # Handle already-completed futures (e.g., skip futures)
+        if future.ok is not None:
+            return future.ok
 
-        return CompilationBatch(trials, list(configs), list(fns), futures)
+        # Acquire semaphore to limit concurrent precompile processes
+        assert self._precompile_semaphore is not None
+        async with self._precompile_semaphore:
+            # Start the process if not started
+            if not future.started:
+                await asyncio.to_thread(future.start)
 
-    async def _wait_for_compilation(
-        self, batch: CompilationBatch[T], desc: str | None
-    ) -> list[bool]:
-        """Wait for a batch compilation to complete.
+            # Wait for process to complete using join() (no polling!)
+            # join(timeout) blocks until process exits or timeout expires
+            # Running in thread pool makes it async without busy-waiting
+            process = future.process
+            assert process is not None
+            timeout = future.seconds_left()
+            await asyncio.to_thread(process.join, timeout)
 
-        Args:
-            batch: CompilationBatch to wait for.
-            desc: Description for progress bar.
+            # Mark complete and consume result (these do actual work, use thread pool)
+            await asyncio.to_thread(future._mark_complete)
+            await asyncio.to_thread(lambda: future._consume_result(raise_on_raise=True))
 
-        Returns:
-            List of booleans indicating which compilations succeeded.
-        """
-        from .base_search import PrecompileFuture
+        assert future.ok is not None
+        return future.ok
 
-        loop = asyncio.get_running_loop()
-
-        # Run the blocking wait_for_all in a thread pool
-        return await loop.run_in_executor(
-            None, PrecompileFuture.wait_for_all, batch.futures, desc
-        )
-
-    async def _benchmark_single(
-        self, config: Config, fn: object, ok: bool, future: PrecompileFuture
+    async def _benchmark_config(
+        self, in_flight: ConfigInFlight[T], ok: bool
     ) -> BenchmarkResult:
-        """Benchmark a single config asynchronously.
+        """Benchmark a compiled config asynchronously.
 
         Args:
-            config: Configuration being benchmarked.
-            fn: Compiled kernel function.
+            in_flight: ConfigInFlight with completed compilation.
             ok: Whether compilation succeeded.
-            future: PrecompileFuture for this config.
 
         Returns:
             BenchmarkResult with performance metrics.
@@ -265,143 +336,238 @@ class PipelinedBatchExecutor[T]:
         from .base_search import BenchmarkResult
 
         compile_time = (
-            future.elapsed if future.process is not None and future.started else None
+            in_flight.future.elapsed
+            if in_flight.future.process is not None and in_flight.future.started
+            else None
         )
 
         if ok:
             # Run benchmark in thread pool to avoid blocking event loop
             loop = asyncio.get_running_loop()
             perf = await loop.run_in_executor(
-                None, self.search.benchmark_function, config, fn
+                None, self.search.benchmark_function, in_flight.config, in_flight.fn
             )
+            # Capture accuracy error immediately after benchmark
+            # (must be done before another benchmark overwrites it)
+            accuracy_error = self.search.last_accuracy_error
+            # Set status based on whether performance is finite
             status = "ok" if math.isfinite(perf) else "error"
         else:
             perf = math.inf
-            status = "timeout" if future.failure_reason == "timeout" else "error"
+            accuracy_error = None  # No accuracy check for failed compilations
+            status = (
+                "timeout" if in_flight.future.failure_reason == "timeout" else "error"
+            )
 
         return BenchmarkResult(
-            config=config,
-            fn=fn,
+            config=in_flight.config,
+            fn=in_flight.fn,
             perf=perf,
             status=status,
             compile_time=compile_time,
+            accuracy_error=accuracy_error,
         )
 
-    async def _benchmark_batch(
-        self, batch: CompilationBatch[T], is_working: list[bool]
-    ) -> list[BenchmarkResult]:
-        """Benchmark a compiled batch.
+    async def _process_config(self, in_flight: ConfigInFlight[T]) -> None:
+        """Process a single config through the pipeline.
 
-        Benchmarks are run sequentially to avoid noisy results from concurrent
-        GPU usage, but each benchmark runs asynchronously.
+        This coroutine handles the entire lifecycle:
+        1. Compile and start precompilation
+        2. Wait for precompilation to complete
+        3. Benchmark the config
+        4. Report the result
 
         Args:
-            batch: CompilationBatch with completed compilation.
-            is_working: List indicating which compilations succeeded.
+            in_flight: ConfigInFlight to process.
 
-        Returns:
-            List of BenchmarkResult objects.
+        Raises:
+            optuna.TrialPruned: If the meta-pruner decides to stop the study.
+                This exception is allowed to propagate to signal study termination.
         """
-        from .base_search import BenchmarkResult
+        try:
+            # Compile and start precompilation
+            in_flight = await self._compile_and_precompile(in_flight)
 
-        results: list[BenchmarkResult] = []
-        for config, fn, ok, future in zip(
-            batch.configs, batch.fns, is_working, batch.futures, strict=True
-        ):
-            result = await self._benchmark_single(config, fn, ok, future)
-            results.append(result)
-        return results
+            # Wait for precompilation
+            ok = await self._wait_for_precompile(in_flight)
 
-    async def _run_async(self, batch_size: int) -> int:
-        """Run the pipelined compilation and benchmarking asynchronously.
+            # Update progress: compilation complete
+            if self.progress_tracker is not None:
+                await asyncio.to_thread(self.progress_tracker.on_compilation_complete)
 
-        Args:
-            batch_size: Number of trials per batch.
+            # Benchmark
+            result = await self._benchmark_config(in_flight, ok)
+
+            # Update progress: benchmark complete
+            if self.progress_tracker is not None:
+                await asyncio.to_thread(self.progress_tracker.on_benchmark_complete)
+
+            # Report result
+            await asyncio.to_thread(
+                self.callbacks.report_result, in_flight.trial, result
+            )
+
+        except Exception as e:
+            # Don't catch TrialPruned - it signals the study should stop
+            # The trial was already marked as COMPLETE before pruning check
+            # Check by class name to avoid importing optuna (keep pipeline generic)
+            if e.__class__.__name__ == "TrialPruned":
+                raise
+
+            # Check for unrecoverable runtime errors (e.g., CUDA illegal memory access)
+            is_unrecoverable = e.__class__.__name__ == "TritonUnrecoverableRuntimeError"
+
+            if is_unrecoverable:
+                if self._had_unrecoverable_error:
+                    # Second unrecoverable error - CUDA context is definitely corrupted
+                    # Abort the search to avoid wasting time on trials that will all fail
+                    self.search.log(
+                        "Second unrecoverable error detected - CUDA context is corrupted.\n"
+                        "Aborting search. Set HELION_AUTOTUNE_PRECOMPILE='spawn' to isolate "
+                        "these errors in subprocesses."
+                    )
+                    # Re-raise to abort the search
+                    raise
+                else:
+                    # First unrecoverable error - try to recover
+                    self._had_unrecoverable_error = True
+                    self.search.log(
+                        "Unrecoverable error detected. Attempting CUDA recovery..."
+                    )
+                    await asyncio.to_thread(self._attempt_cuda_recovery)
+
+            # Report failure - only for unexpected exceptions
+            # (benchmark_function should not raise, it returns inf on failure)
+            import traceback
+
+            from .base_search import BenchmarkResult
+
+            # Log the actual exception for debugging
+            error_msg = f"{e.__class__.__name__}: {e}"
+            self.search.log(f"Pipeline error processing config: {error_msg}")
+
+            # Log full traceback at debug level if verbose
+            if hasattr(self.search, 'settings') and getattr(self.search.settings, 'verbose', False):
+                tb_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                self.search.log(f"Full traceback:\n{tb_str}")
+
+            # Still update progress even on failure
+            if self.progress_tracker is not None:
+                await asyncio.to_thread(self.progress_tracker.on_compilation_complete)
+                await asyncio.to_thread(self.progress_tracker.on_benchmark_complete)
+
+            await asyncio.to_thread(
+                self.callbacks.report_result,
+                in_flight.trial,
+                BenchmarkResult(
+                    config=in_flight.config,
+                    fn=in_flight.fn,
+                    perf=math.inf,
+                    status="error",
+                    compile_time=None,
+                    accuracy_error=None,  # No accuracy check for failed configs
+                ),
+            )
+
+    async def run_async(self) -> int:
+        """Run the stream processing asynchronously.
+
+        This is the async implementation that can be called from async contexts.
+        For synchronous contexts, use run() instead.
 
         Returns:
             Total number of trials completed.
         """
+        # Initialize semaphore for precompile concurrency control
+        # Uses the same limit as BaseSearch._jobs (typically cpu_count)
+        # _jobs is always set in BaseSearch.__init__, so no fallback needed
+        precompile_limit = self.search._jobs
+        self._precompile_semaphore = asyncio.Semaphore(precompile_limit)
+
+        trials_generated = 0
         trials_completed = 0
-
-        # Prepare and start compilation of first batch
-        first_batch = self.callbacks.prepare_batch(batch_size, trials_completed)
-        if not first_batch:
-            return 0
-
-        pending = await self._start_compilation(*first_batch)
+        in_flight_tasks: set[asyncio.Task] = set()
 
         while self.callbacks.should_continue(trials_completed):
-            # Prepare next batch asynchronously
-            next_batch_size = batch_size
-            next_trials_completed = trials_completed + len(pending.configs)
-            prepare_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self.callbacks.prepare_batch, next_batch_size, next_trials_completed
+            # Generate new configs up to max_configs_ahead limit
+            # This controls how far ahead we generate configs before learning from results
+            while (trials_generated - trials_completed) < self.max_configs_ahead:
+                # Try to generate next config
+                next_item = await asyncio.to_thread(
+                    self.callbacks.generate_next, trials_generated
                 )
-            )
 
-            # Wait for current batch compilation
-            batch_num = trials_completed // batch_size + 1
-            desc = self.callbacks.get_batch_description(batch_num, trials_completed)
-            is_working = await self._wait_for_compilation(pending, desc)
+                if next_item is None:
+                    # No more configs to generate
+                    break
 
-            # Get the next batch we prepared (await the task)
-            next_batch = await prepare_task
+                trials_generated += 1
+                trial, config = next_item
 
-            # Start next batch compilation NOW (overlaps with benchmarking)
-            if next_batch:
-                compile_task = asyncio.create_task(self._start_compilation(*next_batch))
-            else:
-                compile_task = None
+                in_flight = ConfigInFlight(trial=trial, config=config)
 
-            # Benchmark current batch while next compiles
-            results = await self._benchmark_batch(pending, is_working)
+                # Update progress: config generated
+                if self.progress_tracker is not None:
+                    await asyncio.to_thread(self.progress_tracker.on_config_generated)
 
-            # Report results
-            await asyncio.to_thread(
-                self.callbacks.report_results, pending.trials, results
-            )
+                # Start processing this config
+                task = asyncio.create_task(self._process_config(in_flight))
+                in_flight_tasks.add(task)
 
-            trials_completed += len(pending.configs)
-
-            # Wait for next batch compilation to finish
-            if compile_task is not None:
-                pending = await compile_task
-            else:
+            # If no tasks in flight, we're done
+            if not in_flight_tasks:
                 break
+
+            # Wait for at least one task to complete
+            done, in_flight_tasks = await asyncio.wait(
+                in_flight_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Check if any task raised TrialPruned or TritonUnrecoverableRuntimeError
+            # (both signal the study should stop)
+            for task in done:
+                if task.exception() is not None:
+                    exc = task.exception()
+                    if exc.__class__.__name__ in ("TrialPruned", "TritonUnrecoverableRuntimeError"):
+                        # Study was pruned or CUDA context corrupted - cancel remaining tasks
+                        for remaining_task in in_flight_tasks:
+                            remaining_task.cancel()
+                        raise exc
+
+            # Update completed count
+            trials_completed += len(done)
+
+        # Wait for any remaining tasks to complete
+        if in_flight_tasks:
+            done_final, _ = await asyncio.wait(in_flight_tasks)
+
+            # Check if any remaining task raised TrialPruned or TritonUnrecoverableRuntimeError
+            for task in done_final:
+                if task.exception() is not None:
+                    exc = task.exception()
+                    if exc.__class__.__name__ in ("TrialPruned", "TritonUnrecoverableRuntimeError"):
+                        raise exc
+
+            trials_completed += len(done_final)
 
         return trials_completed
 
-    def run(self, batch_size: int) -> int:
-        """Run the pipelined compilation and benchmarking.
+    def run(self) -> int:
+        """Run the stream processing synchronously.
 
-        This is a synchronous wrapper around the async implementation.
-
-        Args:
-            batch_size: Number of trials per batch.
+        This creates a new event loop and runs the async implementation.
+        For calling from async contexts, use run_async() directly.
 
         Returns:
             Total number of trials completed.
         """
-        # Set up thread pool for compilation
-        if self.max_compile_workers is not None:
-            executor = ThreadPoolExecutor(max_workers=self.max_compile_workers)
-        else:
-            executor = None
-
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            # Set the default executor for run_in_executor
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            if executor is not None:
-                loop.set_default_executor(executor)
-
-            # Run the async pipeline
-            return loop.run_until_complete(self._run_async(batch_size))
+            # Run the async stream
+            return loop.run_until_complete(self.run_async())
         finally:
             loop.close()
-            if executor is not None:
-                executor.shutdown(wait=True)
 
 
-__all__ = ["CompilationBatch", "PipelineCallbacks", "PipelinedBatchExecutor"]
+__all__ = ["ConfigInFlight", "ProgressTracker", "StreamCallbacks", "StreamExecutor"]

@@ -36,7 +36,7 @@
           config =
             { pkgs }:
             {
-              allowUnfreePredicate = pkgs._cuda.lib.allowUnfreeCudaPredicate;
+              allowUnfree = true;
               cudaCapabilities = [ "8.9" ];
               cudaSupport = true;
             };
@@ -65,6 +65,7 @@
 
           devShells.default = pkgs.mkShell {
             packages = [
+              # pkgs.claude-code
               (pkgs.python3.withPackages (
                 ps: with ps; [
                   cmaes
@@ -75,6 +76,7 @@
                   optuna
                   psutil
                   rich
+                  pytest
                   torch
                   tqdm
                   triton

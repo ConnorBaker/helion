@@ -85,6 +85,10 @@ class BenchmarkResult(NamedTuple):
     perf: float
     status: Literal["ok", "error", "timeout"]
     compile_time: float | None
+    # Accuracy error from benchmark (for constraint-based optimization)
+    # <= 0 means accuracy acceptable, > 0 means violation
+    # None means accuracy was not checked
+    accuracy_error: float | None = None
 
 
 class BaseSearch(BaseAutotuner):
@@ -140,6 +144,9 @@ class BaseSearch(BaseAutotuner):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
+        # Accuracy error from last benchmark (for constraint-based optimization)
+        # <= 0 means accuracy acceptable, > 0 means violation
+        self.last_accuracy_error: float = 0.0
 
     def _next_precompile_result_path(self) -> str:
         assert self._precompile_tmpdir is not None
@@ -336,31 +343,96 @@ class BaseSearch(BaseAutotuner):
 
         return jobs
 
-    def _validate_against_baseline(
+    def _compute_accuracy_error(
         self, config: Config, output: object, args: Sequence[object]
-    ) -> bool:
-        try:
-            torch.testing.assert_close(
-                output,
-                self._baseline_output,
-                atol=self._effective_atol,
-                rtol=self._effective_rtol,
-            )
-            if self._kernel_mutates_args:
-                torch.testing.assert_close(
-                    args,
-                    self._baseline_post_args,
-                    atol=self._effective_atol,
-                    rtol=self._effective_rtol,
-                )
-        except AssertionError as e:
+    ) -> float:
+        """Compute accuracy error relative to baseline.
+
+        Returns a constraint value where:
+        - <= 0 means accuracy is acceptable (within tolerance)
+        - > 0 means accuracy violation (error exceeds tolerance)
+
+        The value represents max(abs_error - atol, rel_error - rtol) across all elements,
+        so it can be used directly as a constraint function value for Optuna.
+
+        Args:
+            config: The configuration being tested.
+            output: The kernel output to validate.
+            args: The kernel arguments (for checking mutation).
+
+        Returns:
+            Constraint value: <= 0 if acceptable, > 0 if violated.
+        """
+        from torch.utils._pytree import tree_flatten
+
+        def compute_tensor_error(actual: object, expected: object) -> float:
+            """Compute max error between two tensors, relative to tolerance."""
+            if not isinstance(actual, torch.Tensor) or not isinstance(
+                expected, torch.Tensor
+            ):
+                return 0.0
+
+            if actual.shape != expected.shape:
+                return float("inf")  # Shape mismatch is infinite error
+
+            # Compute absolute and relative errors
+            diff = (actual.float() - expected.float()).abs()
+            abs_error = diff.max().item()
+
+            # Relative error: |a - b| / max(|a|, |b|, 1e-8)
+            denom = torch.maximum(actual.abs(), expected.abs()).clamp(min=1e-8)
+            rel_error = (diff / denom).max().item()
+
+            # Constraint value: how much we exceed tolerance
+            # Negative = within tolerance, Positive = exceeds tolerance
+            abs_violation = abs_error - self._effective_atol
+            rel_violation = rel_error - self._effective_rtol
+
+            return max(abs_violation, rel_violation)
+
+        max_error = 0.0
+
+        # Check output
+        output_flat, _ = tree_flatten(output)
+        baseline_flat, _ = tree_flatten(self._baseline_output)
+        for actual, expected in zip(output_flat, baseline_flat, strict=False):
+            max_error = max(max_error, compute_tensor_error(actual, expected))
+
+        # Check mutated args if applicable
+        if self._kernel_mutates_args and self._baseline_post_args is not None:
+            args_flat, _ = tree_flatten(args)
+            baseline_args_flat, _ = tree_flatten(self._baseline_post_args)
+            for actual, expected in zip(args_flat, baseline_args_flat, strict=False):
+                max_error = max(max_error, compute_tensor_error(actual, expected))
+
+        if max_error > 0:
             self.counters["accuracy_mismatch"] += 1
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
-                    f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
+                    f"Config accuracy error: {config!r}\n"
+                    f"Max error exceeds tolerance by {max_error:.6f}\n"
+                    f"Use HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
                 )
-            return False
-        return True
+
+        return max_error
+
+    def _validate_against_baseline(
+        self, config: Config, output: object, args: Sequence[object]
+    ) -> bool:
+        """Check if output matches baseline within tolerance.
+
+        This is a convenience wrapper around _compute_accuracy_error for
+        backward compatibility with code that expects a boolean result.
+
+        Args:
+            config: The configuration being tested.
+            output: The kernel output to validate.
+            args: The kernel arguments (for checking mutation).
+
+        Returns:
+            True if accuracy is acceptable, False otherwise.
+        """
+        return self._compute_accuracy_error(config, output, args) <= 0
 
     def benchmark(self, config: Config) -> tuple[Callable[..., object], float]:
         """
@@ -384,12 +456,16 @@ class BaseSearch(BaseAutotuner):
         Benchmark a compiled function.  This function is called by the autotuner to measure the
         performance of a specific configuration.
 
+        After calling this method, the accuracy error can be retrieved from
+        `self.last_accuracy_error` (constraint value: <= 0 means acceptable, > 0 means violated).
+
         Args:
             config: The configuration to benchmark.
             fn: A precompiled version of config.
 
         Returns:
-            The performance of the configuration in ms.
+            The performance of the configuration in ms, or inf if accuracy check fails
+            (when accuracy checking is enabled and not using constraint-based optimization).
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
@@ -402,12 +478,21 @@ class BaseSearch(BaseAutotuner):
             torch.accelerator.synchronize()
             output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
-            if (
-                self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
-            ):
-                # Accuracy check failed; reject this config
-                return inf
+
+            # Compute and store accuracy error for constraint-based optimization
+            # The accuracy error is always stored so callers can use it as a constraint
+            # value for samplers that support constraints_func (e.g., TPE, CmaEs, GP)
+            self.last_accuracy_error = 0.0
+            if self.settings.autotune_accuracy_check:
+                self.last_accuracy_error = self._compute_accuracy_error(
+                    config, output, self.args
+                )
+                # Note: We intentionally do NOT return early on accuracy failure.
+                # This allows us to still get actual performance metrics for
+                # constraint-based optimization, where the sampler uses both
+                # the objective value (performance) and constraint values (accuracy)
+                # to guide the search.
+
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
@@ -610,6 +695,8 @@ class BaseSearch(BaseAutotuner):
             if is_working:
                 # benchmark one-by-one to avoid noisy results
                 perf = self.benchmark_function(config, fn)
+                # Capture accuracy error immediately after benchmark
+                accuracy_error = self.last_accuracy_error
                 status = "ok" if math.isfinite(perf) else "error"
                 results.append(
                     BenchmarkResult(
@@ -618,6 +705,7 @@ class BaseSearch(BaseAutotuner):
                         perf=perf,
                         status=status,
                         compile_time=compile_time,
+                        accuracy_error=accuracy_error,
                     )
                 )
             else:
@@ -629,6 +717,7 @@ class BaseSearch(BaseAutotuner):
                         perf=inf,
                         status=status,
                         compile_time=compile_time,
+                        accuracy_error=None,  # No accuracy check for failed compilations
                     )
                 )
         return results
@@ -1237,20 +1326,49 @@ class PrecompileFuture:
             elif self.failure_reason is None:
                 self.failure_reason = "error"
             return self.ok
-        process.terminate()
-        process.join(10)
+
+        # Kill the entire process group to ensure child processes (like ptxas) are terminated
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
-        if process.is_alive():
-            if not self.search.settings.autotune_ignore_errors:
-                self.search.log.warning(
-                    msg,
-                    "(SIGKILL required)",
-                )
-            process.kill()
-            process.join()
+        pid = process.pid
+        if pid is not None:
+            # Try to kill the process group (works on Unix)
+            try:
+                import signal
+                os.killpg(pid, signal.SIGTERM)
+                process.join(10)
+
+                if process.is_alive():
+                    if not self.search.settings.autotune_ignore_errors:
+                        self.search.log.warning(msg, "(SIGKILL required)")
+                    os.killpg(pid, signal.SIGKILL)
+                    process.join()
+                else:
+                    if not self.search.settings.autotune_ignore_errors:
+                        self.search.log.warning(msg)
+            except (OSError, AttributeError, ProcessLookupError):
+                # Fallback to regular process termination (Windows or if killpg fails)
+                process.terminate()
+                process.join(10)
+                if process.is_alive():
+                    if not self.search.settings.autotune_ignore_errors:
+                        self.search.log.warning(msg, "(SIGKILL required)")
+                    process.kill()
+                    process.join()
+                else:
+                    if not self.search.settings.autotune_ignore_errors:
+                        self.search.log.warning(msg)
         else:
-            if not self.search.settings.autotune_ignore_errors:
-                self.search.log.warning(msg)
+            # No PID available, use regular termination
+            process.terminate()
+            process.join(10)
+            if process.is_alive():
+                if not self.search.settings.autotune_ignore_errors:
+                    self.search.log.warning(msg, "(SIGKILL required)")
+                process.kill()
+                process.join()
+            else:
+                if not self.search.settings.autotune_ignore_errors:
+                    self.search.log.warning(msg)
 
         self.ok = False
         self.failure_reason = "timeout"
@@ -1409,6 +1527,13 @@ def _run_kernel_in_subprocess_spawn(
     result_path: str,
     decorator: str,
 ) -> None:
+    # Create a new process group so we can kill all descendants
+    # This ensures child processes like ptxas are also terminated
+    try:
+        os.setpgrp()
+    except Exception:
+        pass  # Windows doesn't support setpgrp
+
     status = 0
     try:
         fn = _load_compiled_fn(fn_spec)
@@ -1497,6 +1622,13 @@ def _run_kernel_in_subprocess_fork(
     result_path: str,
     decorator: str,
 ) -> None:
+    # Create a new process group so we can kill all descendants
+    # This ensures child processes like ptxas are also terminated
+    try:
+        os.setpgrp()
+    except Exception:
+        pass  # Windows doesn't support setpgrp
+
     status = 0
     try:
         precompiler()
